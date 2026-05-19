@@ -40,6 +40,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Aiba-Browser-Debian
-          # You may need to adjust this path depending on where your script outputs the final file
-          path: chrome 
+          # Update this path to where the compiler actually puts the file!
+          path: ungoogled-chromium/build/src/out/Default/chrome 
           retention-days: 3
