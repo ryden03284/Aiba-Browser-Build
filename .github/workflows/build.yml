@@ -18,25 +18,19 @@ jobs:
           docker system prune -af || true
           df -h
 
-      - name: 2. Create Swap Space (Memory Safety)
-        run: |
-          # Use dd instead of fallocate to bypass cloud filesystem restrictions
-          sudo dd if=/dev/zero of=/swapfile bs=1M count=10240 status=progress
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+    
 
-      - name: 3. Checkout Code Repository
+      - name: 2. Checkout Code Repository
         uses: actions/checkout@v4
 
-      - name: 4. Execute Your Custom Script
+      - name: 3. Execute Your Custom Script
         run: |
     
           # Your exact build command
           chmod +x build_aiba_debian.sh
           ./build_aiba_debian.sh
 
-      - name: 5. Upload Final Artifact (Optional)
+      - name: 4. Upload Final Artifact (Optional)
         uses: actions/upload-artifact@v4
         with:
           name: Aiba-Browser-Debian
