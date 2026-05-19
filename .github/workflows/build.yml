@@ -27,8 +27,8 @@ jobs:
         run: |
     
           # Your exact build command
-          chmod +x build_aiba_debian.sh
-          ./build_aiba_debian.sh
+          chmod +x build_aiba.sh
+          ./build_aiba.sh
 
       - name: 4. Upload Final Artifact (Optional)
         uses: actions/upload-artifact@v4
