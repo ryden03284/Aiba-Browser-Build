@@ -20,8 +20,8 @@ jobs:
 
       - name: 2. Create Swap Space (Memory Safety)
         run: |
-          # Prevents the compiler from crashing due to running out of RAM
-          sudo fallocate -l 10G /swapfile
+          # Use dd instead of fallocate to bypass cloud filesystem restrictions
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=10240 status=progress
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
