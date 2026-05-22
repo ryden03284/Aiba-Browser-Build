@@ -21,7 +21,11 @@ sudo apt-get update && sudo apt-get install -y ccache
 
 export CCACHE_DIR="$HOME/.cache/ccache"
 mkdir -p "$CCACHE_DIR"
-ccache -M 15G
+
+# Force aggressive Zstd compression to stay safely under GitHub's 10GB limit
+export CCACHE_COMPRESS=1
+export CCACHE_COMPRESSLEVEL=6
+ccache -M 9G
 
 # Intercept standard compiler paths so dpkg-buildpackage automatically uses ccache
 export PATH="/usr/lib/ccache:$PATH"
@@ -85,9 +89,9 @@ fi
 export AIBA_CHROMIUM_SRC="${DEBIAN_DIR}"
 
 # --- Aiba branding (after unpack, before package build) ---
-# Check stamps again before letting branding modify code paths
-if [[ -f "debian/stamp/setup" && -f "debian/stamp/build" ]]; then
-  step "Source already branded and compilation is underway. Skipping branding injection..."
+# FIXED: Changed from '&&' to '||' so it skips branding if EITHER setup is complete or src is present
+if [[ -f "debian/stamp/setup" || -d "src" ]]; then
+  step "Source already unpacked/patched. Skipping branding injection to prevent file conflicts..."
 else
   step "Injecting Aiba product logos"
   mkdir -p "${BRANDING_DIR}"
@@ -122,6 +126,9 @@ export PATH="/usr/lib/ccache:$PATH"
 
 # Runs the compiler. Because of our checks above, it will reuse existing obj/ intermediate binaries
 nice -n 19 dpkg-buildpackage -b -uc || die "dpkg-buildpackage failed"
+
+# Clean up temporary database indexes right before closing to compress the cache directory
+ccache --cleanup
 
 step "Build complete"
 DEB_OUT_DIR="$(dirname "${DEBIAN_DIR}")"
