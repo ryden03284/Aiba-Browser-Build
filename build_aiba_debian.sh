@@ -1,154 +1,353 @@
 #!/usr/bin/env bash
-# Aiba — build via official ungoogled-chromium-debian packaging (.deb)
-set -euo pipefail
+# ====================================================================
+# Aiba Browser Build Script
+# Production CI/CD Version for ungoogled-chromium Debian packaging
+# ====================================================================
 
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# --------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------
 AIBA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEBIAN_REPO_URL="https://github.com/ungoogled-software/ungoogled-chromium-debian.git"
 DEBIAN_DIR="${AIBA_ROOT}/ungoogled-chromium-debian"
-VENV="${AIBA_ROOT}/.venv"
-BRANDING_DIR="${AIBA_ROOT}/branding"
-PATCHES_DIR="${BRANDING_DIR}/patches"
 UC_UTILS="${DEBIAN_DIR}/debian/submodules/ungoogled-chromium/utils"
 
-die() { echo "ERROR: $*" >&2; exit 1; }
-step() { echo ""; echo "==> $*"; }
+VENV="${AIBA_ROOT}/.venv"
 
-# ====================================================================
-# GLOBAL COMPILER CACHE SETUP (ccache activation)
-# ====================================================================
-step "Configuring Global Compiler Cache Engine"
-sudo apt-get update && sudo apt-get install -y ccache
+BRANDING_DIR="${AIBA_ROOT}/branding"
+PATCHES_DIR="${BRANDING_DIR}/patches"
 
-export CCACHE_DIR="$HOME/.cache/ccache"
-mkdir -p "$CCACHE_DIR"
+SCRIPTS_DIR="${AIBA_ROOT}/scripts"
 
-# Force aggressive Zstd compression to stay safely under GitHub's 10GB limit
-export CCACHE_COMPRESS=1
-export CCACHE_COMPRESSLEVEL=6
-ccache -M 9G
+STATE_DIR="${AIBA_ROOT}/.aiba_state"
+BUILD_KEY_FILE="${STATE_DIR}/branding.buildkey"
+PATCH_STAMP="${STATE_DIR}/patches_applied"
 
-# Intercept standard compiler paths so dpkg-buildpackage automatically uses ccache
-export PATH="/usr/lib/ccache:$PATH"
-ccache -s
-
-ensure_venv() {
-  if [[ ! -d "${VENV}/bin" ]]; then
-    step "Creating Python .venv (PEP 668 safe; no system pip)"
-    python3 -m venv "${VENV}" 2>/dev/null \
-      || die "Could not create .venv — install: sudo apt install python3-venv python3-full"
-  fi
-  if ! "${VENV}/bin/python3" -c "import PIL" 2>/dev/null; then
-    step "Installing Pillow into .venv"
-    "${VENV}/bin/pip" install --upgrade pip
-    "${VENV}/bin/pip" install -r "${AIBA_ROOT}/requirements.txt" \
-      || die "Failed to install Pillow into .venv"
-  fi
-  cat > "${AIBA_ROOT}/.aiba_env.sh" <<EOF
-export AIBA_PYTHON="${VENV}/bin/python3"
-export AIBA_ROOT="${AIBA_ROOT}"
-EOF
+# --------------------------------------------------------------------
+# LOGGING / ERROR HANDLING
+# --------------------------------------------------------------------
+step() {
+    echo
+    echo "===================================================================="
+    echo "==> $*"
+    echo "===================================================================="
 }
 
-# --- prerequisites ---
-step "Checking prerequisites"
-ensure_venv
-PYTHON="${VENV}/bin/python3"
+warn() {
+    echo "WARNING: $*" >&2
+}
 
-for cmd in git python3 patch curl unzip dpkg-buildpackage mk-build-deps; do
-  command -v "${cmd}" >/dev/null 2>&1 || die "Required command not found: ${cmd} — run: sudo apt install devscripts equivs git curl unzip patch"
+fail() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+cleanup() {
+    echo
+    echo "Cleaning temporary state..."
+}
+
+trap cleanup EXIT
+trap 'echo "Build failed at line $LINENO" >&2' ERR
+
+# --------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------
+require_file() {
+    [[ -f "$1" ]] || fail "Required file missing: $1"
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 \
+        || fail "Missing required command: $1"
+}
+
+hash_inputs() {
+    {
+        git -C "$DEBIAN_DIR" rev-parse HEAD 2>/dev/null || true
+
+        find "$BRANDING_DIR" "$SCRIPTS_DIR" \
+            -type f \
+            \( \
+                -name '*.py' \
+                -o -name '*.sh' \
+                -o -name '*.patch' \
+                -o -name 'series' \
+            \) \
+            -print0 2>/dev/null \
+        | LC_ALL=C sort -z \
+        | xargs -0 sha256sum 2>/dev/null || true
+
+    } | sha256sum | awk '{print $1}'
+}
+
+# --------------------------------------------------------------------
+# CHECK REQUIRED PROJECT FILES
+# --------------------------------------------------------------------
+step "Checking required Aiba project files"
+
+require_file "${BRANDING_DIR}/setup_aiba.py"
+require_file "${SCRIPTS_DIR}/install_ublock_default_app.sh"
+require_file "${SCRIPTS_DIR}/apply_debian_prefs.py"
+
+# --------------------------------------------------------------------
+# INSTALL SYSTEM PACKAGES
+# --------------------------------------------------------------------
+step "Installing system packages"
+
+sudo apt-get update -y
+
+sudo apt-get install -y \
+    build-essential \
+    devscripts \
+    equivs \
+    ccache \
+    git \
+    curl \
+    patch \
+    python3 \
+    python3-venv \
+    python3-pip \
+    unzip \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    pkg-config
+
+# --------------------------------------------------------------------
+# VERIFY REQUIRED COMMANDS
+# --------------------------------------------------------------------
+step "Verifying required commands"
+
+for cmd in \
+    git \
+    curl \
+    patch \
+    python3 \
+    dpkg-buildpackage \
+    mk-build-deps \
+    equivs-build \
+    apt-get \
+    ccache \
+    sha256sum \
+    pkg-config
+do
+    require_cmd "$cmd"
 done
 
-# --- clone debian packaging repo ---
-step "Ensuring ungoogled-chromium-debian repository"
-if [[ ! -d "${DEBIAN_DIR}/.git" ]]; then
-  git clone "${DEBIAN_REPO_URL}" "${DEBIAN_DIR}" || die "Failed to clone ${DEBIAN_REPO_URL}"
-else
-  echo "Repository already present: ${DEBIAN_DIR}"
+# --------------------------------------------------------------------
+# ENABLE SWAP FOR CLOUD RUNNERS
+# --------------------------------------------------------------------
+step "Configuring swap memory"
+
+if ! swapon --show | grep -q '/swapfile'; then
+
+    sudo fallocate -l 8G /swapfile \
+        || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+
+    sudo chmod 600 /swapfile
+    sudo mkswap /swapfile
+    sudo swapon /swapfile
 fi
 
-cd "${DEBIAN_DIR}"
-[[ -f debian/rules ]] || die "debian/rules missing — clone/submodule failure?"
+# --------------------------------------------------------------------
+# PYTHON VIRTUAL ENVIRONMENT
+# --------------------------------------------------------------------
+step "Preparing Python virtual environment"
 
-
-# ====================================================================
-# PROTECTION RULE: Check for existing/compiled build states
-# ====================================================================
-if [[ -f "debian/stamp/setup" || -d "src" || -d "out" || -f "debian/stamp/build" ]]; then
-  step "PROTECTION ACTIVE: Existing build files or compilation data detected. Skipping destructive steps to preserve progress!"
-else
-  step "No existing build data found. Proceeding with clean initialization..."
-  
-  step "Updating git submodules"
-  git submodule update --init --recursive || die "git submodule update failed"
-
-  step "Preparing local Chromium source (debian/rules setup)"
-  debian/rules setup || die "debian/rules setup failed"
+if [[ ! -d "$VENV" ]]; then
+    python3 -m venv "$VENV"
 fi
 
-# Chromium tree root = packaging repo root after setup
-export AIBA_CHROMIUM_SRC="${DEBIAN_DIR}"
+PYTHON="${VENV}/bin/python3"
+PIP="${VENV}/bin/pip"
 
-# --- Aiba branding (after unpack, before package build) ---
-# FIXED: Changed from '&&' to '||' so it skips branding if EITHER setup is complete or src is present
-if [[ -f "debian/stamp/setup" || -d "src" ]]; then
-  step "Source already unpacked/patched. Skipping branding injection to prevent file conflicts..."
-else
-  step "Injecting Aiba product logos"
-  mkdir -p "${BRANDING_DIR}"
-  touch "${BRANDING_DIR}/inject_logo.py"
-  
-  "${PYTHON}" "${BRANDING_DIR}/inject_logo.py" || die "inject_logo.py failed"                        
+"$PIP" install --upgrade pip
 
-  step "Applying Aiba BRANDING patch"
-  [[ -f "${UC_UTILS}/patches.py" ]] || die "ungoogled-chromium utils not found — submodules incomplete?"
-  python3 "${UC_UTILS}/patches.py" apply "${DEBIAN_DIR}" "${PATCHES_DIR}" \
-    || die "Failed to apply Aiba branding patches"
+if [[ -f "${AIBA_ROOT}/requirements.txt" ]]; then
+    "$PIP" install -r "${AIBA_ROOT}/requirements.txt"
 fi
 
-step "Patching UI strings (Chromium -> Aiba)"
-AIBA_SKIP_LOGO=1 "${PYTHON}" "${BRANDING_DIR}/setup_aiba.py" || die "setup_aiba.py failed"
+# --------------------------------------------------------------------
+# CCACHE CONFIGURATION
+# --------------------------------------------------------------------
+step "Configuring compiler cache"
 
-step "Installing uBlock Origin as default app"
-"${AIBA_ROOT}/scripts/install_ublock_default_app.sh" "${DEBIAN_DIR}" "${PYTHON}" \
-  || die "uBlock default app install failed"
+export CCACHE_DIR="$HOME/.cache/ccache"
 
-step "Merging Aiba preferences into debian/initial_preferences"
-"${PYTHON}" "${AIBA_ROOT}/scripts/apply_debian_prefs.py" "${DEBIAN_DIR}" \
-  || die "apply_debian_prefs.py failed"
+mkdir -p "$CCACHE_DIR"
 
-# --- install build-deps & compile .deb ---
-step "Installing missing build dependencies (# mk-build-deps)"
-rm -f ../ungoogled-chromium-build-deps_* 2>/dev/null || true
+export CCACHE_COMPRESS=1
+export CCACHE_COMPRESSLEVEL=6
 
-step "Building Debian package (dpkg-buildpackage -b -uc)"
-export DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS:-} parallel=4"
 export PATH="/usr/lib/ccache:$PATH"
 
-# Runs the compiler. Because of our checks above, it will reuse existing obj/ intermediate binaries
-nice -n 19 dpkg-buildpackage -b -uc || die "dpkg-buildpackage failed"
+ccache -M 9G || true
+ccache -s || true
 
-# Clean up temporary database indexes right before closing to compress the cache directory
-ccache --cleanup
+# --------------------------------------------------------------------
+# CLONE OR UPDATE REPOSITORY
+# --------------------------------------------------------------------
+step "Preparing ungoogled-chromium-debian repository"
 
-step "Build complete"
-DEB_OUT_DIR="$(dirname "${DEBIAN_DIR}")"
-mapfile -t BUILT_DEBS < <(find "${DEB_OUT_DIR}" -maxdepth 1 -type f -name 'ungoogled-chromium_*.deb' ! -name '*build-deps*' 2>/dev/null | sort)
-
-echo ""
-if ((${#BUILT_DEBS[@]} == 0)); then
-  echo "WARNING: No .deb found in ${DEB_OUT_DIR}"
-  echo "  The build step may have failed — scroll up for errors."
-  echo "  If you built elsewhere, run: find ~ -maxdepth 2 -name 'ungoogled-chromium_*.deb'"
+if [[ ! -d "${DEBIAN_DIR}/.git" ]]; then
+    git clone "$DEBIAN_REPO_URL" "$DEBIAN_DIR"
 else
-  echo "Generated package(s) in ${DEB_OUT_DIR}:"
-  printf '  %s\n' "${BUILT_DEBS[@]}"
-  echo ""
-  echo "Install (do NOT use a literal asterisk — use this script):"
-  echo "  ${AIBA_ROOT}/scripts/install_deb.sh"
-  echo ""
-  echo "Or install the exact file:"
-  echo "  sudo dpkg -i ${BUILT_DEBS[0]}"
+    git -C "$DEBIAN_DIR" fetch --all --prune
+    git -C "$DEBIAN_DIR" pull --ff-only
 fi
-echo ""
-echo "Binary after install: /usr/lib/chromium/chrome"
-echo "Preferences: /usr/lib/chromium/initial_preferences"
+
+cd "$DEBIAN_DIR"
+
+require_file "debian/rules"
+
+# --------------------------------------------------------------------
+# UPDATE SUBMODULES
+# --------------------------------------------------------------------
+step "Updating submodules"
+
+git submodule sync --recursive
+git submodule update --init --recursive
+
+# --------------------------------------------------------------------
+# INSTALL BUILD DEPENDENCIES
+# --------------------------------------------------------------------
+step "Installing Debian build dependencies"
+
+sudo mk-build-deps \
+    --install \
+    --remove \
+    --tool 'apt-get -y --no-install-recommends' \
+    debian/control
+
+# --------------------------------------------------------------------
+# SOURCE SETUP
+# --------------------------------------------------------------------
+step "Preparing ungoogled-chromium source tree"
+
+# Upstream packaging already supports incremental setup safely.
+debian/rules setup
+
+export AIBA_CHROMIUM_SRC="${DEBIAN_DIR}"
+
+# --------------------------------------------------------------------
+# APPLY PATCHES SAFELY
+# --------------------------------------------------------------------
+step "Applying branding patches"
+
+mkdir -p "$PATCHES_DIR"
+mkdir -p "$STATE_DIR"
+
+touch "${PATCHES_DIR}/series"
+
+if [[ -f "${UC_UTILS}/patches.py" ]] \
+   && find "$PATCHES_DIR" -type f -name '*.patch' -print -quit | grep -q .
+then
+
+    if [[ ! -f "$PATCH_STAMP" ]]; then
+
+        "$PYTHON" \
+            "${UC_UTILS}/patches.py" \
+            apply \
+            "$DEBIAN_DIR" \
+            "$PATCHES_DIR"
+
+        touch "$PATCH_STAMP"
+
+    else
+        echo "Patches already applied"
+    fi
+
+else
+    warn "No branding patches found or ungoogled-chromium utils missing"
+fi
+
+# --------------------------------------------------------------------
+# BRANDING / CUSTOMIZATION
+# --------------------------------------------------------------------
+CURRENT_KEY="$(hash_inputs)"
+PREVIOUS_KEY="$(cat "$BUILD_KEY_FILE" 2>/dev/null || true)"
+
+if [[ "$CURRENT_KEY" != "$PREVIOUS_KEY" ]]; then
+
+    step "Applying Aiba customizations"
+
+    "$PYTHON" "${BRANDING_DIR}/setup_aiba.py"
+
+    "$PYTHON" \
+        "${SCRIPTS_DIR}/apply_debian_prefs.py" \
+        "$DEBIAN_DIR"
+
+    "${SCRIPTS_DIR}/install_ublock_default_app.sh" \
+        "$DEBIAN_DIR"
+
+    printf '%s\n' "$CURRENT_KEY" > "$BUILD_KEY_FILE"
+
+else
+
+    step "Branding already up-to-date"
+
+fi
+
+# --------------------------------------------------------------------
+# BUILD PACKAGE
+# --------------------------------------------------------------------
+step "Building ungoogled-chromium Debian packages"
+
+# Chromium is RAM-heavy.
+# Conservative parallelism prevents OOM crashes in CI.
+export DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS:-} parallel=2"
+
+export NINJA_SUMMARIZE_BUILD=1
+
+nice -n 19 dpkg-buildpackage -b -uc
+
+# --------------------------------------------------------------------
+# CLEANUP
+# --------------------------------------------------------------------
+step "Cleaning compiler cache"
+
+ccache --cleanup || true
+
+# --------------------------------------------------------------------
+# FIND OUTPUT PACKAGES
+# --------------------------------------------------------------------
+step "Searching for built packages"
+
+DEB_OUT_DIR="$(dirname "$DEBIAN_DIR")"
+
+mapfile -t BUILT_DEBS < <(
+    find "$DEB_OUT_DIR" \
+        -maxdepth 1 \
+        -type f \
+        -name 'ungoogled-chromium_*.deb' \
+        ! -name '*build-deps*' \
+        | sort
+)
+
+if (( ${#BUILT_DEBS[@]} == 0 )); then
+    fail "No ungoogled-chromium .deb packages were produced"
+fi
+
+echo
+echo "Generated package(s):"
+
+printf '  %s\n' "${BUILT_DEBS[@]}"
+
+echo
+echo "Install with:"
+echo "sudo dpkg -i ${BUILT_DEBS[0]}"
+
+echo
+echo "Binary path after install:"
+echo "/usr/lib/chromium/chrome"
+
+echo
+echo "Initial preferences path:"
+echo "/usr/lib/chromium/initial_preferences"
+
+echo
+step "Build completed successfully"
