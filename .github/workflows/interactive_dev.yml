@@ -1,0 +1,25 @@
+name: Interactive Cloud Terminal
+
+on:
+  workflow_dispatch: # Allows you to manually trigger this workspace from the web UI
+
+jobs:
+  interactive-shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # Keeps the terminal alive for up to 6 full hours
+
+    steps:
+      - name: Checkout Aiba Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Pre-install Build Prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts equivs git curl unzip patch python3-venv python3-full tmux
+
+      - name: Launch Live SSH Terminal Session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: false # Forces the workflow to pause and hand the terminal over to you
