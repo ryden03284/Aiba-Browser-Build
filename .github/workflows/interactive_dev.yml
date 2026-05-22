@@ -17,9 +17,20 @@ jobs:
       - name: Pre-install Build Prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y devscripts equivs git curl unzip patch python3-venv python3-full tmux
+          sudo apt-get install -y devscripts equivs git curl unzip patch python3-venv python3-full tmux ccache
+
+      - name: Restore/Save 10GB Compiler Cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
 
       - name: Launch Live SSH Terminal Session
         uses: mxschmitt/action-tmate@v3
         with:
-          detached: false # Forces the workflow to pause and hand the terminal over to you
+          # Forces the workflow to pause and hand the terminal over to you
+          detached: false 
+          # CRITICAL SAFETY: Locks the door so only your ED25519 authentication key can get in
+          limit-access-to-actor: true
