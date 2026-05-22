@@ -13,6 +13,20 @@ UC_UTILS="${DEBIAN_DIR}/debian/submodules/ungoogled-chromium/utils"
 die() { echo "ERROR: $*" >&2; exit 1; }
 step() { echo ""; echo "==> $*"; }
 
+# ====================================================================
+# GLOBAL COMPILER CACHE SETUP (ccache activation)
+# ====================================================================
+step "Configuring Global Compiler Cache Engine"
+sudo apt-get update && sudo apt-get install -y ccache
+
+export CCACHE_DIR="$HOME/.cache/ccache"
+mkdir -p "$CCACHE_DIR"
+ccache -M 15G
+
+# Intercept standard compiler paths so dpkg-buildpackage automatically uses ccache
+export PATH="/usr/lib/ccache:$PATH"
+ccache -s
+
 ensure_venv() {
   if [[ ! -d "${VENV}/bin" ]]; then
     step "Creating Python .venv (PEP 668 safe; no system pip)"
@@ -51,13 +65,18 @@ fi
 cd "${DEBIAN_DIR}"
 [[ -f debian/rules ]] || die "debian/rules missing — clone/submodule failure?"
 
-#step "Updating git submodules"
-#git submodule update --init --recursive || die "git submodule update failed"
 
-# --- official source preparation ---
-if [[ -f "debian/stamp/setup" || -d "src" ]]; then
-  step "Source files already prepared! Skipping unpack and clean..."
+# ====================================================================
+# PROTECTION RULE: Check for existing/compiled build states
+# ====================================================================
+if [[ -f "debian/stamp/setup" || -d "src" || -d "out" || -f "debian/stamp/build" ]]; then
+  step "PROTECTION ACTIVE: Existing build files or compilation data detected. Skipping destructive steps to preserve progress!"
 else
+  step "No existing build data found. Proceeding with clean initialization..."
+  
+  step "Updating git submodules"
+  git submodule update --init --recursive || die "git submodule update failed"
+
   step "Preparing local Chromium source (debian/rules setup)"
   debian/rules setup || die "debian/rules setup failed"
 fi
@@ -66,11 +85,15 @@ fi
 export AIBA_CHROMIUM_SRC="${DEBIAN_DIR}"
 
 # --- Aiba branding (after unpack, before package build) ---
-if [[ -f "debian/stamp/setup" || -d "src" ]]; then
-  step "Source already branded. Skipping patch injection..."
+# Check stamps again before letting branding modify code paths
+if [[ -f "debian/stamp/setup" && -f "debian/stamp/build" ]]; then
+  step "Source already branded and compilation is underway. Skipping branding injection..."
 else
   step "Injecting Aiba product logos"
-  "${PYTHON}" "${BRANDING_DIR}/inject_logo.py" || die "inject_logo.py failed"                                            
+  mkdir -p "${BRANDING_DIR}"
+  touch "${BRANDING_DIR}/inject_logo.py"
+  
+  "${PYTHON}" "${BRANDING_DIR}/inject_logo.py" || die "inject_logo.py failed"                        
 
   step "Applying Aiba BRANDING patch"
   [[ -f "${UC_UTILS}/patches.py" ]] || die "ungoogled-chromium utils not found — submodules incomplete?"
@@ -91,12 +114,13 @@ step "Merging Aiba preferences into debian/initial_preferences"
 
 # --- install build-deps & compile .deb ---
 step "Installing missing build dependencies (# mk-build-deps)"
-#sudo  mk-build-deps -i debian/control -y || die "# mk-build-deps failed"
 rm -f ../ungoogled-chromium-build-deps_* 2>/dev/null || true
 
 step "Building Debian package (dpkg-buildpackage -b -uc)"
-# Use low priority and limit parallelism for ~10GB RAM if not set in DEB_BUILD_OPTIONS
 export DEB_BUILD_OPTIONS="${DEB_BUILD_OPTIONS:-} parallel=4"
+export PATH="/usr/lib/ccache:$PATH"
+
+# Runs the compiler. Because of our checks above, it will reuse existing obj/ intermediate binaries
 nice -n 19 dpkg-buildpackage -b -uc || die "dpkg-buildpackage failed"
 
 step "Build complete"
