@@ -1,0 +1,11 @@
+{
+  "ExtensionManifestV2Availability": 1,
+  "extensions": {
+    "ui": {
+      "developer_mode": true
+    }
+  },
+  "distribution": {
+    "skip_first_run_ui": true
+  }
+}

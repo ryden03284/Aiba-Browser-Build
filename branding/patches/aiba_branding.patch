@@ -1,0 +1,20 @@
+--- a/chrome/app/theme/chromium/BRANDING
++++ b/chrome/app/theme/chromium/BRANDING
+@@ -1,8 +1,8 @@
+-COMPANY_FULLNAME=The Chromium Authors
+-COMPANY_SHORTNAME=The Chromium Authors
+-PRODUCT_FULLNAME=Chromium
+-PRODUCT_SHORTNAME=Chromium
+-PRODUCT_INSTALLER_FULLNAME=Chromium Installer
+-PRODUCT_INSTALLER_SHORTNAME=Chromium Installer
+-COPYRIGHT=Copyright @LASTCHANGE_YEAR@ The Chromium Authors. All rights reserved.
+-MAC_BUNDLE_ID=org.chromium.Chromium
++COMPANY_FULLNAME=Aiba Authors
++COMPANY_SHORTNAME=Aiba Authors
++PRODUCT_FULLNAME=Aiba
++PRODUCT_SHORTNAME=Aiba
++PRODUCT_INSTALLER_FULLNAME=Aiba Installer
++PRODUCT_INSTALLER_SHORTNAME=Aiba Installer
++COPYRIGHT=Copyright @LASTCHANGE_YEAR@ Aiba Authors. All rights reserved.
++MAC_BUNDLE_ID=org.aiba.browser
+ MAC_CREATOR_CODE=Cr24

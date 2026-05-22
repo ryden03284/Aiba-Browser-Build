@@ -1,0 +1,15 @@
+{
+  "distribution": {
+    "skip_first_run_ui": true,
+    "import_bookmarks": false,
+    "import_history": false,
+    "import_search_engine": false,
+    "import_home_page": false
+  },
+  "extensions": {
+    "ui": {
+      "developer_mode": true
+    }
+  },
+  "ExtensionManifestV2Availability": 1
+}
