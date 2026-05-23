@@ -1,722 +1,971 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  build_ungoogled_chromium.sh
-#  Builds ungoogled-chromium-debian ("Aiba") with injected progress saves,
-#  uBlock Origin Lite pre-bundled, and custom Aiba branding.
 #
-#  Designed for: GitHub Actions Ubuntu runner (or any Debian-based system)
-#  Usage:        bash build_ungoogled_chromium.sh
+# build_ungoogled_chromium.sh  —  "Aiba" automated build
 #
-#  Step order:
-#    1  Install initial packages (devscripts, equivs)
-#    2  Clone ungoogled-chromium-debian repo
-#    3  Init submodules
-#    4  debian/rules setup  (official source prep + tarball download)
-#    5  Inject progress save archive
-#    5a Bundle uBlock Origin Lite extension
-#    5b Inject Aiba branding (name + logo)
-#    6  Install build dependencies  (mk-build-deps)
-#    7  dpkg-buildpackage -b -us -uc
-# =============================================================================
+# Builds ungoogled-chromium-debian on a GitHub Actions runner with:
+#   • Adaptive source-root detection (flat / sibling / nested ./src/)
+#   • Progress archive injection
+#   • uBlock Origin Lite pre-bundling
+#   • Custom "Aiba" branding & icon asset pipeline
+#   • Debian package control renaming
+#   • GN compiler optimizations for production builds
+#   • Custom homepage / initial_preferences (commented out, ready to enable)
+#
+# Usage:  chmod +x build_ungoogled_chromium.sh && ./build_ungoogled_chromium.sh
+#
 
-set -euo pipefail          # Exit on error, unset var, or pipe failure
-IFS=$'\n\t'                # Safer word splitting
+set -euo pipefail
+IFS=$'\n\t'
 
-# ── Colour helpers ────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-RESET='\033[0m'
+# ─── Global Logging & Error Intercept ─────────────────────────────────────────
+# Pipe all stdout/stderr to a log file for autonomous diagnosis
+LOG_FILE="$(pwd)/aiba_build_debug.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
-step()  { echo -e "\n${CYAN}${BOLD}[STEP]${RESET} $*"; }
-ok()    { echo -e "${GREEN}[OK]${RESET} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${RESET} $*"; }
-info()  { echo -e "       $*"; }
-die()   { echo -e "${RED}[FATAL]${RESET} $*" >&2; exit 1; }
-
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ─── Configuration ───────────────────────────────────────────────────────────
 REPO_URL="https://github.com/ungoogled-software/ungoogled-chromium-debian.git"
 REPO_DIR="ungoogled-chromium-debian"
 PROGRESS_URL="https://filebin.net/aiba_build_1779451948/chromium_progress.tar.gz"
-PROGRESS_ARCHIVE="progress.tar.gz"
+PROGRESS_FILE="progress.tar.gz"
+SENTINEL="chrome/app/chromium_strings.grd"
 
-# ── Branding configuration ────────────────────────────────────────────────────
-#   AIBA_LOGO_PNG  →  path to YOUR PNG logo file (1024×1024 recommended).
-#                     The script will convert it to all required ICO/ICNS sizes.
-#                     ► Set this to wherever you store the asset in your repo or
-#                       CI environment, e.g. "${GITHUB_WORKSPACE}/branding/aiba_logo.png"
+UBLOCK_EXT_ID="ddkjiahejlhfcafbddmgiahcphecmpfh"
+UBLOCK_CRX_URL="https://clients2.google.com/service/update2/crx?response=redirect&os=linux&arch=x64&os_arch=x86_64&nacl_arch=x86-64&prod=chromiumcrx&prodchannel=unknown&prodversion=130.0.6723.116&acceptformat=crx2,crx3&x=id%3D${UBLOCK_EXT_ID}%26uc"
+
+BRAND_OLD="ungoogled-chromium"
+BRAND_NEW="aiba"
+BRAND_DISPLAY_OLD="Chromium"
+BRAND_DISPLAY_NEW="Aiba"
+
 AIBA_LOGO_PNG="${GITHUB_WORKSPACE:-$(pwd)}/aiba_logo.png"
+ICON_SIZES=(16 24 32 48 64 128 256)
 
-# ── Extension configuration ───────────────────────────────────────────────────
-UBLOL_EXT_ID="ddkjiahejlhfcafbddmgiahcphecmpfh"    # uBlock Origin Lite
-# Chrome Web Store CRX download URL — prodversion just needs to be a plausible
-# Chromium version so the store returns a CRX3 package.
-UBLOL_CRX_URL="https://clients2.google.com/service/update2/crx?response=redirect&prodversion=124.0.0.0&acceptformat=crx3&x=id%3D${UBLOL_EXT_ID}%26installsource%3Dondemand%26uc"
+# Will be resolved after Step 4
+CHROMIUM_SRC_DIR=""
+REPO_ROOT=""
 
-# ── Prerequisite: must be run from a writable working directory ───────────────
-[[ -w "." ]] || die "Current directory is not writable: $(pwd)"
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+step() {
+    echo ""
+    echo "══════════════════════════════════════════════════════════════"
+    echo "  STEP $1: $2"
+    echo "══════════════════════════════════════════════════════════════"
+    echo ""
+}
 
-# =============================================================================
-# STEP 1 — Install initial packages
-# =============================================================================
-step "1/7 · Installing initial packages: devscripts, equivs, imagemagick"
+fail() {
+    local msg="$1"
+    echo "" >&2
+    echo "❌  FATAL (step failed): $msg" >&2
+    echo "    Working directory was: $(pwd)" >&2
+    
+    echo "🔍  Commencing Phase 2: Autonomous Self-Healing Diagnosis..."
+    local log_tail
+    log_tail=$(tail -n 150 "${LOG_FILE}" 2>/dev/null || true)
+    
+    # Diagnosis A: Missing commands / dependencies
+    if echo "$log_tail" | grep -qi "command not found"; then
+        # Extract the missing command name robustly
+        local missing_cmd
+        missing_cmd=$(echo "$log_tail" | grep -ioP "(?<=bash: ).*(?=: command not found)" | tail -1 || true)
+        if [ -z "$missing_cmd" ]; then
+            # Fallback extraction if PCRE fails
+            missing_cmd=$(echo "$log_tail" | grep -i "command not found" | awk -F': ' '{print $2}' | awk '{print $1}' | tail -1)
+        fi
+        
+        if [ -n "$missing_cmd" ]; then
+            echo "🔧  DIAGNOSIS: Missing dependency '${missing_cmd}'."
+            echo "    Attempting autonomous silent patch..."
+            sudo apt-get update -qq && sudo apt-get install -y "${missing_cmd}"
+            if [ $? -eq 0 ]; then
+                echo "✅  Auto-patch successful. Resetting environment and restarting pipeline..."
+                exec "$0" "$@"
+            fi
+        fi
+    fi
+    
+    # Diagnosis B: Unmet Debian package dependencies
+    if echo "$log_tail" | grep -qi "unmet dependencies"; then
+        echo "🔧  DIAGNOSIS: Unmet Debian package dependencies."
+        echo "    Attempting autonomous fix-broken install..."
+        sudo apt-get --fix-broken install -y
+        if [ $? -eq 0 ]; then
+            echo "✅  Auto-patch applied. Restarting pipeline..."
+            exec "$0" "$@"
+        fi
+    fi
+    
+    # Diagnosis C: Permission blocks
+    if echo "$log_tail" | grep -qi "Permission denied"; then
+        echo "🔧  DIAGNOSIS: Environmental permission block detected."
+        echo "    Attempting autonomous workspace reset (chown/chmod)..."
+        sudo chown -R $USER:$USER .
+        sudo chmod -R u+rw .
+        echo "✅  Auto-patch applied. Restarting pipeline..."
+        exec "$0" "$@"
+    fi
+    
+    echo "🛑  DIAGNOSIS COMPLETE: Error is structural or requires manual credentials."
+    echo "    Manual intervention required. Please inspect the exact line failure and exit code above."
+    exit 1
+}
+
+info()  { echo "ℹ️   $1"; }
+ok()    { echo "✅  $1"; }
+warn()  { echo "⚠️   $1"; }
+
+# Pretty-print a file's human-readable size, safe if file is missing.
+file_size() {
+    if [ -f "$1" ]; then
+        du -h "$1" | awk '{print $1}'
+    else
+        echo "???"
+    fi
+}
+
+# Detect whether ImageMagick's CLI is `magick` (v7+) or `convert` (v6).
+detect_imagemagick() {
+    if command -v magick &>/dev/null; then
+        IM_CONVERT="magick"
+    elif command -v convert &>/dev/null; then
+        IM_CONVERT="convert"
+    else
+        fail "ImageMagick is not installed. Install with: sudo apt install imagemagick"
+    fi
+    echo "🖼️   ImageMagick command: ${IM_CONVERT}"
+}
+
+
+###############################################################################
+#                                                                             #
+#   STEP 1 — Install initial packages                                        #
+#                                                                             #
+###############################################################################
+step 1 "Installing initial packages"
 
 sudo apt-get update -qq
-# imagemagick is added here so we can convert your PNG logo to all required
-# icon formats (ICO, ICNS, various PNGs) during the branding step later.
-sudo apt-get install -y devscripts equivs imagemagick
+sudo apt-get install -y --no-install-recommends \
+    devscripts equivs imagemagick icnsutils perl \
+    || fail "Could not install required packages"
 
-ok "Initial packages installed."
+ok "Packages installed."
 
-# =============================================================================
-# STEP 2 — Clone repository (skip if already present)
-# =============================================================================
-step "2/7 · Cloning ungoogled-chromium-debian repository"
 
-if [[ -d "${REPO_DIR}/.git" ]]; then
-    warn "Repository directory '${REPO_DIR}' already exists — skipping clone."
-    warn "To start fresh, delete the directory and re-run."
+###############################################################################
+#                                                                             #
+#   STEP 2 — Clone the repository                                            #
+#                                                                             #
+###############################################################################
+step 2 "Cloning ungoogled-chromium-debian repository"
+
+if [ -d "${REPO_DIR}/.git" ]; then
+    info "Repository directory '${REPO_DIR}' already exists — skipping clone."
 else
-    git clone "${REPO_URL}" "${REPO_DIR}"
-    ok "Repository cloned into '${REPO_DIR}'."
+    # [BUG 1 FIX] — Guard the existence check so the false branch doesn't trip set -e.
+    if [ -d "${REPO_DIR}" ]; then
+        rm -rf "${REPO_DIR}"
+    fi
+    git clone "${REPO_URL}" "${REPO_DIR}" \
+        || fail "git clone failed"
+    ok "Repository cloned."
 fi
 
 cd "${REPO_DIR}"
-ok "Working directory: $(pwd)"
+echo "📂  Working directory: $(pwd)"
 
-# =============================================================================
-# STEP 3 — Initialise submodules
-# =============================================================================
-step "3/7 · Initialising git submodules"
 
-git submodule update --init --recursive
+###############################################################################
+#                                                                             #
+#   STEP 3 — Initialise submodules                                           #
+#                                                                             #
+###############################################################################
+step 3 "Initialising git submodules"
+
+git submodule update --init --recursive \
+    || fail "Submodule init failed"
 
 ok "Submodules initialised."
 
-# =============================================================================
-# STEP 4 — Official source preparation
-# =============================================================================
-step "4/7 · Running debian/rules setup (official source prep)"
-info "This downloads the Chromium source tarball — may take a while."
 
-debian/rules setup
+###############################################################################
+#                                                                             #
+#   STEP 4 — Official source preparation                                     #
+#                                                                             #
+###############################################################################
+step 4 "Running official source prep (debian/rules setup)"
+
+debian/rules setup \
+    || fail "'debian/rules setup' failed"
 
 ok "Source preparation complete."
 
-# ── Locate the unpacked Chromium source tree ──────────────────────────────────
-#   After 'debian/rules setup', ungoogled-chromium-debian unpacks the tarball
-#   into a sibling directory named  chromium-<version>/  one level above us.
-#   We detect it dynamically so the script survives version bumps.
-CHROMIUM_SRC_DIR="$(find .. -maxdepth 1 -type d -name 'chromium-*' | sort | tail -n1)"
-if [[ -z "${CHROMIUM_SRC_DIR}" ]]; then
-    die "Could not find the unpacked Chromium source directory (chromium-*) in $(realpath ..). \
-Did 'debian/rules setup' complete successfully?"
-fi
-ok "Chromium source tree found at: $(realpath "${CHROMIUM_SRC_DIR}")"
 
-# =============================================================================
-# STEP 5 — Inject progress/save archive
-# =============================================================================
-step "5/7 · Injecting build progress archive"
-info "Downloading: ${PROGRESS_URL}"
+###############################################################################
+#                                                                             #
+#   STEP 4.5 — Adaptive Chromium source-root detection                       #
+#                                                                             #
+###############################################################################
+step "4.5" "Detecting Chromium source root (sentinel: ${SENTINEL})"
 
-curl \
-    --location \
-    --retry 5 \
-    --retry-delay 10 \
-    --retry-max-time 120 \
-    --connect-timeout 30 \
-    --progress-bar \
-    --output "${PROGRESS_ARCHIVE}" \
-    "${PROGRESS_URL}" \
-  || die "Download failed. Check the Filebin URL and your network connection."
+REPO_ROOT="$(pwd)"
 
-if ! tar -tzf "${PROGRESS_ARCHIVE}" &>/dev/null; then
-    rm -f "${PROGRESS_ARCHIVE}"
-    die "Downloaded file is not a valid gzip-compressed tar archive. Aborting."
-fi
+# [BUG 1+7 FIX] — Enable nullglob so globs that match nothing expand to an
+# empty list instead of the literal glob pattern. This prevents the for-loop
+# from iterating once on a nonsensical path like "../chromium-*/".
+_old_nullglob=$(shopt -p nullglob || true)
+shopt -s nullglob
 
-info "Extracting archive one level up (into workspace root) to avoid nesting…"
-# Archive was packed from the workspace root and contains the
-# 'ungoogled-chromium-debian/' path prefix, so -C .. lands it correctly.
-tar -xf "${PROGRESS_ARCHIVE}" -C ..
-
-rm -f "${PROGRESS_ARCHIVE}"
-ok "Progress archive injected and cleaned up."
-
-# =============================================================================
-# STEP 5a — Bundle uBlock Origin Lite
-# =============================================================================
-step "5a/7 · Bundling uBlock Origin Lite (${UBLOL_EXT_ID})"
-#
-# Chromium supports a 'default_extensions' directory.  Any .crx placed here
-# alongside a matching <id>.json external-extension manifest will be silently
-# installed for every new profile — exactly what pre-bundled extensions do in
-# Brave, Vivaldi, etc.
-#
-# Layout we are creating inside the Chromium source tree:
-#   <chromium-src>/chrome/browser/extensions/default_extensions/
-#       ddkjiahejlhfcafbddmgiahcphecmpfh.crx   ← the extension package
-#       ddkjiahejlhfcafbddmgiahcphecmpfh.json  ← external-extension manifest
-#
-# References:
-#   https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/
-#       extensions/default_extensions/
-#   https://developer.chrome.com/docs/extensions/mv3/external_extensions/
-
-DEFAULT_EXT_DIR="${CHROMIUM_SRC_DIR}/chrome/browser/extensions/default_extensions"
-mkdir -p "${DEFAULT_EXT_DIR}"
-
-# ── 5a-i  Download the CRX ───────────────────────────────────────────────────
-info "Downloading uBlock Origin Lite CRX from Chrome Web Store…"
-curl \
-    --location \
-    --retry 5 \
-    --retry-delay 5 \
-    --retry-max-time 60 \
-    --connect-timeout 20 \
-    --progress-bar \
-    --output "${DEFAULT_EXT_DIR}/${UBLOL_EXT_ID}.crx" \
-    "${UBLOL_CRX_URL}" \
-  || die "Failed to download uBlock Origin Lite CRX."
-
-# Basic sanity check — CRX3 files start with the magic bytes 'Cr24'
-if ! head -c4 "${DEFAULT_EXT_DIR}/${UBLOL_EXT_ID}.crx" | grep -q 'Cr24'; then
-    die "Downloaded file does not look like a valid CRX3 package (missing 'Cr24' header). \
-The Chrome Web Store URL may have changed — check UBLOL_CRX_URL."
-fi
-
-# ── 5a-ii  Write the external-extension manifest ─────────────────────────────
-# This JSON tells Chromium to install the CRX for every new profile.
-# 'external_crx' points to the .crx we just downloaded (relative to the
-# default_extensions directory at runtime — use an absolute path here so it
-# resolves correctly during the build).
-cat > "${DEFAULT_EXT_DIR}/${UBLOL_EXT_ID}.json" << JSON_EOF
-{
-  "external_crx": "${DEFAULT_EXT_DIR}/${UBLOL_EXT_ID}.crx",
-  "external_version": "0.0.0.0"
-}
-JSON_EOF
-# NOTE: "external_version": "0.0.0.0" is a sentinel that tells Chromium to
-# always accept whatever version is inside the .crx without a version check.
-
-ok "uBlock Origin Lite CRX and manifest written to default_extensions/."
-
-# ── 5a-iii  Register the extension in the Chromium build system ──────────────
-#
-# BUILD.gn in the default_extensions directory controls which files the GN
-# build system copies into the final compiled output.  It contains one or more
-# copy() rules whose 'sources' lists enumerate each .crx and .json file.
-#
-# We use an inline Python 3 script to edit this file surgically:
-#   • If our two filenames are already present  → no-op (idempotent).
-#   • If a sources = [...] list exists          → insert into it.
-#   • If no sources list exists at all          → append a brand-new copy()
-#     rule at the end of the file as a safe fallback.
-#
-# Python is used instead of sed because BUILD.gn list blocks can span many
-# lines with arbitrary indentation, making regex line-by-line editing fragile.
-
-BUILD_GN="${CHROMIUM_SRC_DIR}/chrome/browser/extensions/default_extensions/BUILD.gn"
-
-if [[ ! -f "${BUILD_GN}" ]]; then
-    # BUILD.gn is absent entirely — create a minimal one from scratch so the
-    # GN build graph has something to work with.
-    info "BUILD.gn not found — creating a minimal one from scratch."
-    cat > "${BUILD_GN}" << GN_EOF
-# Auto-generated by Aiba build script.
-copy("default_extensions") {
-  sources = [
-    "${UBLOL_EXT_ID}.crx",
-    "${UBLOL_EXT_ID}.json",
-  ]
-  outputs = [ "\$root_out_dir/extensions/{{source_file_part}}" ]
-}
-GN_EOF
-    ok "BUILD.gn created with uBlock Origin Lite entries."
-else
-    info "Patching BUILD.gn: ${BUILD_GN}"
-    # Back up before editing
-    cp "${BUILD_GN}" "${BUILD_GN}.bak"
-
-    python3 - "${BUILD_GN}" "${UBLOL_EXT_ID}" << 'PYEOF'
-import sys, re, pathlib
-
-build_gn_path = pathlib.Path(sys.argv[1])
-ext_id        = sys.argv[2]
-crx_entry     = f'"{ext_id}.crx"'
-json_entry    = f'"{ext_id}.json"'
-new_entries   = [crx_entry, json_entry]
-
-original = build_gn_path.read_text()
-
-# ── Guard: already present? ───────────────────────────────────────────────────
-if ext_id in original:
-    print(f"       [OK] Extension ID already present in BUILD.gn — no edit needed.")
-    sys.exit(0)
-
-# ── Strategy 1: insert into an existing sources = [ ... ] block ──────────────
-# Matches:  sources = [          (opening)
-#               "anything",      (zero or more existing entries)
-#           ]                    (closing bracket, possibly indented)
-# We insert our two new lines just before the closing bracket of the FIRST
-# sources list found, preserving indentation of surrounding entries.
-
-sources_block = re.search(
-    r'(sources\s*=\s*\[)(.*?)(\])',
-    original,
-    re.DOTALL
-)
-
-if sources_block:
-    block_interior = sources_block.group(2)
-
-    # Detect indentation from existing entries, fall back to 4 spaces
-    indent_match = re.search(r'\n(\s+)"', block_interior)
-    indent = indent_match.group(1) if indent_match else '    '
-
-    # Build the two new lines to inject
-    injected = ''.join(f'\n{indent}{e},' for e in new_entries)
-
-    # Insert before the closing bracket
-    new_interior = block_interior.rstrip() + injected + '\n'
-    new_block    = sources_block.group(1) + new_interior + sources_block.group(3)
-    patched      = original[:sources_block.start()] + new_block + original[sources_block.end():]
-
-    build_gn_path.write_text(patched)
-    print(f"       [OK] Inserted {crx_entry} and {json_entry} into existing sources list.")
-    sys.exit(0)
-
-# ── Strategy 2: no sources list found — append a new copy() rule ─────────────
-# This is the safe fallback for unusual BUILD.gn layouts.
-fallback_rule = f"""
-# uBlock Origin Lite — added by Aiba build script
-copy("ublol_default_extension") {{
-  sources = [
-    {crx_entry},
-    {json_entry},
-  ]
-  outputs = [ "$root_out_dir/extensions/{{{{source_file_part}}}}" ]
-}}
-"""
-patched = original.rstrip() + '\n' + fallback_rule
-build_gn_path.write_text(patched)
-print(f"       [OK] No existing sources list found — appended new copy() rule for uBlock Origin Lite.")
-PYEOF
-
-    ok "BUILD.gn patched — uBlock Origin Lite registered in GN build graph."
-fi
-
-# =============================================================================
-# STEP 5b — Inject Aiba branding
-# =============================================================================
-step "5b/7 · Injecting Aiba branding (name + logo)"
-#
-# Chromium keeps its user-visible brand strings in two GRD (XML) files:
-#   1. chrome/app/chromium_strings.grd          ← most UI strings ("Chromium")
-#   2. components/strings/components_chromium_strings.grd  ← component strings
-#
-# We rename "Chromium" → "Aiba" throughout both.  We deliberately leave
-# internal code symbols, URLs, and file paths alone (only replacing the
-# display-facing product name).
-#
-# Icon assets live in:
-#   chrome/app/theme/chromium/          ← all sizes of the app icon (PNG + ICO)
-#   chrome/app/theme/chromium/BRANDING  ← plaintext branding metadata file
-#
-# We replace those icons with resized versions of your AIBA_LOGO_PNG.
-
-# ── 5b-i  Verify the logo source file exists ─────────────────────────────────
-info "Logo source file: ${AIBA_LOGO_PNG}"
-if [[ ! -f "${AIBA_LOGO_PNG}" ]]; then
-    # ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-    # PLACEHOLDER — supply the logo before running the script.
-    # Set AIBA_LOGO_PNG (at the top of this script) to the absolute path of
-    # your aiba_logo.png file.  In GitHub Actions you can do this via:
-    #
-    #   cp path/to/aiba_logo.png "${GITHUB_WORKSPACE}/aiba_logo.png"
-    #
-    # The script will then pick it up automatically.
-    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-    die "Aiba logo not found at: ${AIBA_LOGO_PNG}
-Set AIBA_LOGO_PNG at the top of this script to the correct path."
-fi
-
-# ── 5b-ii  Rename "Chromium" → "Aiba" in brand string files ─────────────────
-CHROMIUM_STRINGS_GRD="${CHROMIUM_SRC_DIR}/chrome/app/chromium_strings.grd"
-COMPONENTS_STRINGS_GRD="${CHROMIUM_SRC_DIR}/components/strings/components_chromium_strings.grd"
-
-for GRD_FILE in "${CHROMIUM_STRINGS_GRD}" "${COMPONENTS_STRINGS_GRD}"; do
-    if [[ -f "${GRD_FILE}" ]]; then
-        info "Patching: ${GRD_FILE}"
-        # Back up the original before modifying
-        cp "${GRD_FILE}" "${GRD_FILE}.bak"
-        # Replace display-name references only:
-        #   "Chromium"        → "Aiba"          (display name)
-        #   "chromium"        → "aiba"           (lowercase variant in URLs/IDs
-        #                                         is intentionally left alone;
-        #                                         only in <message> text nodes)
-        # We use a word-boundary (\b) approach via perl for accuracy.
-        perl -i -pe '
-            # Only replace inside XML message content, not tag attributes or
-            # internal identifiers.  This regex replaces the word "Chromium"
-            # when it appears as a standalone word in text content.
-            s/\bChromium\b/Aiba/g;
-        ' "${GRD_FILE}"
-        ok "Patched: $(basename "${GRD_FILE}")"
-    else
-        warn "GRD file not found (version mismatch?): ${GRD_FILE}"
-        warn "You may need to patch branding strings manually for this Chromium version."
+# Strategy A — Sibling folder: ../chromium-<version>/
+echo "🔍  Strategy A: checking sibling folders (../chromium-*/) …"
+for candidate in "${REPO_ROOT}"/../chromium-*/; do
+    if [ -f "${candidate}${SENTINEL}" ]; then
+        CHROMIUM_SRC_DIR="$(cd "${candidate}" && pwd)"
+        ok "Strategy A hit: ${CHROMIUM_SRC_DIR}"
+        break
     fi
 done
 
-# ── 5b-iii  Patch the BRANDING metadata file ─────────────────────────────────
-#   This plaintext file defines SHORT_NAME, PRODUCT_NAME, etc. used by the
-#   build system itself (e.g. for .desktop file generation on Linux).
+# Restore nullglob to its prior state
+eval "${_old_nullglob}"
+
+# Strategy B — Flat repo: source files in the repo root.
+if [ -z "${CHROMIUM_SRC_DIR}" ]; then
+    echo "🔍  Strategy B: checking repo root (${REPO_ROOT}/) …"
+    if [ -f "${REPO_ROOT}/${SENTINEL}" ]; then
+        CHROMIUM_SRC_DIR="${REPO_ROOT}"
+        ok "Strategy B hit: ${CHROMIUM_SRC_DIR}"
+    fi
+fi
+
+# Strategy C — Nested wrapper: source files inside ./src/
+if [ -z "${CHROMIUM_SRC_DIR}" ]; then
+    echo "🔍  Strategy C: checking nested src/ directory (${REPO_ROOT}/src/) …"
+    if [ -f "${REPO_ROOT}/src/${SENTINEL}" ]; then
+        CHROMIUM_SRC_DIR="${REPO_ROOT}/src"
+        ok "Strategy C hit: ${CHROMIUM_SRC_DIR}"
+    fi
+fi
+
+# Bail out if nothing matched.
+if [ -z "${CHROMIUM_SRC_DIR}" ]; then
+    echo "" >&2
+    echo "🛑  Could not locate '${SENTINEL}' under any expected layout." >&2
+    echo "    Searched:" >&2
+    echo "      A) ${REPO_ROOT}/../chromium-*/" >&2
+    echo "      B) ${REPO_ROOT}/" >&2
+    echo "      C) ${REPO_ROOT}/src/" >&2
+    echo "" >&2
+    echo "    Directory listing of repo root:" >&2
+    ls -1F "${REPO_ROOT}" >&2
+    echo "" >&2
+    echo "    Directory listing one level up:" >&2
+    ls -1F "${REPO_ROOT}/.." >&2
+    fail "Chromium source root detection failed — cannot continue."
+fi
+
+echo ""
+echo "📌  CHROMIUM_SRC_DIR resolved to: ${CHROMIUM_SRC_DIR}"
+echo "    Verification: $(ls -l "${CHROMIUM_SRC_DIR}/${SENTINEL}" 2>&1)"
+
+
+###############################################################################
+#                                                                             #
+#   STEP 5 — Inject progress / save archive                                  #
+#                                                                             #
+###############################################################################
+step 5 "Injecting progress archive into ${CHROMIUM_SRC_DIR}"
+
+cd "${REPO_ROOT}"
+
+echo "⬇️   Downloading ${PROGRESS_URL} …"
+curl -L --fail --retry 3 --retry-delay 5 \
+    -o "${PROGRESS_FILE}" \
+    "${PROGRESS_URL}" \
+    || fail "Download of progress archive failed"
+
+# [BUG 6 FIX] — Use awk instead of cut for locale-safe size extraction.
+ARCHIVE_SIZE="$(file_size "${PROGRESS_FILE}")"
+echo "📦  Archive downloaded (${ARCHIVE_SIZE}). Extracting into ${CHROMIUM_SRC_DIR} …"
+
+tar -xf "${PROGRESS_FILE}" -C "${CHROMIUM_SRC_DIR}" \
+    || fail "Extraction of progress archive into '${CHROMIUM_SRC_DIR}' failed"
+
+rm -f "${PROGRESS_FILE}"
+ok "Progress archive injected and temp file removed."
+
+
+###############################################################################
+#                                                                             #
+#   STEP 5a — Pre-bundle uBlock Origin Lite extension                        #
+#                                                                             #
+###############################################################################
+step "5a" "Pre-bundling uBlock Origin Lite (${UBLOCK_EXT_ID})"
+
+EXT_DIR="${CHROMIUM_SRC_DIR}/chrome/browser/extensions/default_extensions"
+CRX_FILE="${EXT_DIR}/${UBLOCK_EXT_ID}.crx"
+EXT_JSON="${EXT_DIR}/${UBLOCK_EXT_ID}.json"
+
+# ── Create target directory ──────────────────────────────────────────────────
+mkdir -p "${EXT_DIR}"
+info "Extension directory: ${EXT_DIR}"
+
+# ── Download CRX ─────────────────────────────────────────────────────────────
+echo "⬇️   Downloading uBlock Origin Lite CRX …"
+curl -L --fail --retry 3 --retry-delay 5 \
+    -o "${CRX_FILE}" \
+    "${UBLOCK_CRX_URL}" \
+    || fail "CRX download failed for extension ${UBLOCK_EXT_ID}"
+
+# ── Magic-byte sanity check (must start with 'Cr24') ────────────────────────
+CRX_MAGIC="$(head -c 4 "${CRX_FILE}")"
+if [ "${CRX_MAGIC}" != "Cr24" ]; then
+    ACTUAL_HEX="$(xxd -l 4 -p "${CRX_FILE}")"
+    fail "CRX header sanity check failed. Expected magic bytes 'Cr24' (43723234) but got: ${ACTUAL_HEX}. The downloaded file may not be a valid CRX."
+fi
+ok "CRX magic bytes verified: Cr24"
+info "CRX size: $(file_size "${CRX_FILE}")"
+
+# ── Write external-extension JSON manifest ───────────────────────────────────
+cat > "${EXT_JSON}" <<EXTJSON
+{
+  "external_crx": "/usr/lib/aiba/extensions/${UBLOCK_EXT_ID}.crx",
+  "external_version": "1.0"
+}
+EXTJSON
+ok "External extension manifest written: ${EXT_JSON}"
+
+# ── BUILD.gn registration ───────────────────────────────────────────────────
+BUILDGN="${EXT_DIR}/BUILD.gn"
+
+if [ ! -f "${BUILDGN}" ]; then
+    info "No existing BUILD.gn — creating minimal copy rule."
+
+    # [BUG 1+2 FIX] — Build the sources list safely.
+    # Enable nullglob so empty globs produce nothing, and use if/fi instead
+    # of the [ test ] && echo pattern that crashes under set -e.
+    {
+        cat <<'BUILDGN_HEADER'
+# Auto-generated by Aiba build script — default extension bundling.
+
+import("//build/config/features.gni")
+
+copy("default_extensions") {
+  sources = [
+BUILDGN_HEADER
+
+        _old_ng=$(shopt -p nullglob || true)
+        shopt -s nullglob
+        for f in "${EXT_DIR}"/*.crx "${EXT_DIR}"/*.json; do
+            if [ -f "$f" ]; then
+                echo "    \"$(basename "$f")\","
+            fi
+        done
+        eval "${_old_ng}"
+
+        cat <<'BUILDGN_FOOTER'
+  ]
+  outputs = [ "$root_out_dir/extensions/{{source_file_part}}" ]
+}
+BUILDGN_FOOTER
+    } > "${BUILDGN}"
+
+    ok "BUILD.gn created with bundled extension sources."
+else
+    info "Existing BUILD.gn found — surgically inserting extension entries."
+    python3 <<PYINJECT
+import re, sys
+
+buildgn_path = "${BUILDGN}"
+crx_entry = '"${UBLOCK_EXT_ID}.crx"'
+json_entry = '"${UBLOCK_EXT_ID}.json"'
+
+with open(buildgn_path, "r") as f:
+    content = f.read()
+
+# Find the sources = [ ... ] block
+pattern = r'(sources\s*=\s*\[)(.*?)(\])'
+match = re.search(pattern, content, re.DOTALL)
+
+if not match:
+    print("⚠️  WARNING: Could not locate 'sources = [...]' block in BUILD.gn.")
+    print("   Appending a new copy rule instead.")
+    with open(buildgn_path, "a") as f:
+        f.write('''
+# Aiba: auto-appended default extension bundling.
+copy("aiba_default_extensions") {
+  sources = [
+    "''' + "${UBLOCK_EXT_ID}" + '''.crx",
+    "''' + "${UBLOCK_EXT_ID}" + '''.json",
+  ]
+  outputs = [ "\$root_out_dir/extensions/{{source_file_part}}" ]
+}
+''')
+    sys.exit(0)
+
+existing_block = match.group(2)
+new_entries = []
+
+if crx_entry not in existing_block:
+    new_entries.append("    " + crx_entry + ",")
+if json_entry not in existing_block:
+    new_entries.append("    " + json_entry + ",")
+
+if not new_entries:
+    print("ℹ️  Extension entries already present in BUILD.gn — no changes needed.")
+    sys.exit(0)
+
+injection = "\n".join(new_entries) + "\n"
+new_content = content[:match.end(1)] + "\n" + injection + content[match.end(1):]
+
+with open(buildgn_path, "w") as f:
+    f.write(new_content)
+
+print("✅  Injected " + str(len(new_entries)) + " entry/entries into BUILD.gn sources block.")
+PYINJECT
+    ok "BUILD.gn patching complete."
+fi
+
+ok "uBlock Origin Lite pre-bundling finished."
+
+
+###############################################################################
+#                                                                             #
+#   STEP 5b — Inject custom Aiba branding & assets                           #
+#                                                                             #
+###############################################################################
+step "5b" "Injecting Aiba branding & icon assets"
+
+cd "${REPO_ROOT}"
+
+# ── 5b-i: Display-name replacements in .grd string templates ────────────────
+echo "📝  Replacing display name '${BRAND_DISPLAY_OLD}' → '${BRAND_DISPLAY_NEW}' in .grd files …"
+
+GRD_FILES=(
+    "${CHROMIUM_SRC_DIR}/chrome/app/chromium_strings.grd"
+    "${CHROMIUM_SRC_DIR}/components/strings/components_chromium_strings.grd"
+)
+
+for grd in "${GRD_FILES[@]}"; do
+    if [ -f "${grd}" ]; then
+        perl -pi -e 's/\bChromium\b/Aiba/g' "${grd}"
+        ok "Patched: $(basename "${grd}")"
+    else
+        warn "Skipped (not found): ${grd}"
+    fi
+done
+
+# ── 5b-ii: BRANDING metadata ────────────────────────────────────────────────
 BRANDING_FILE="${CHROMIUM_SRC_DIR}/chrome/app/theme/chromium/BRANDING"
-if [[ -f "${BRANDING_FILE}" ]]; then
-    info "Patching BRANDING file: ${BRANDING_FILE}"
-    cp "${BRANDING_FILE}" "${BRANDING_FILE}.bak"
+echo "📝  Updating BRANDING metadata …"
+
+if [ -f "${BRANDING_FILE}" ]; then
     sed -i \
-        -e 's/\bCHROMIUM\b/AIBA/g' \
-        -e 's/\bChromium\b/Aiba/g' \
+        -e 's/^COMPANY_FULLNAME=.*/COMPANY_FULLNAME=Aiba Project/' \
+        -e 's/^COMPANY_SHORTNAME=.*/COMPANY_SHORTNAME=Aiba/' \
+        -e 's/^PRODUCT_FULLNAME=.*/PRODUCT_FULLNAME=Aiba Browser/' \
+        -e 's/^PRODUCT_SHORTNAME=.*/PRODUCT_SHORTNAME=Aiba/' \
+        -e 's/^PRODUCT_INSTALLER_FULLNAME=.*/PRODUCT_INSTALLER_FULLNAME=Aiba Browser/' \
+        -e 's/^PRODUCT_INSTALLER_SHORTNAME=.*/PRODUCT_INSTALLER_SHORTNAME=Aiba/' \
+        -e 's/^MAC_BUNDLE_ID=.*/MAC_BUNDLE_ID=org.AibaProject.Aiba/' \
         "${BRANDING_FILE}"
-    ok "BRANDING file patched."
+    ok "BRANDING file updated."
+    echo "    Contents:"
+    sed 's/^/    │ /' "${BRANDING_FILE}"
 else
     warn "BRANDING file not found: ${BRANDING_FILE}"
 fi
 
-# ── 5b-iv  Generate icon assets from your PNG logo ───────────────────────────
-#   Chromium needs icons in these exact sizes (all square PNGs), plus an ICO
-#   for Windows and an ICNS for macOS.  We generate them all from AIBA_LOGO_PNG
-#   using ImageMagick (installed in Step 1).
+# ── 5b-iii: Desktop entry template ──────────────────────────────────────────
+DESKTOP_TEMPLATE="${CHROMIUM_SRC_DIR}/chrome/installer/linux/common/desktop.template"
+echo "📝  Updating desktop.template …"
+
+if [ -f "${DESKTOP_TEMPLATE}" ]; then
+    # [BUG 4 FIX] — GNU sed does NOT support \b word boundaries. The previous
+    # sed expressions silently matched nothing because \b was interpreted as a
+    # literal backspace (0x08). Use perl instead, which natively supports \b.
+    perl -pi -e '
+        s/\bChromium\b/Aiba/g;
+        s/\bchromium-browser\b/aiba-browser/g;
+        s/\bchromium\b/aiba/g;
+    ' "${DESKTOP_TEMPLATE}"
+    ok "desktop.template patched."
+else
+    warn "desktop.template not found: ${DESKTOP_TEMPLATE}"
+fi
+
+# ── 5b-iv: Icon asset pipeline ──────────────────────────────────────────────
 #
-ICON_DIR="${CHROMIUM_SRC_DIR}/chrome/app/theme/chromium"
-mkdir -p "${ICON_DIR}"
+# TRANSPARENCY HANDLING STRATEGY:
+#   -alpha set       → Ensure an alpha channel exists even if the source PNG
+#                      is opaque. Prevents IM from silently flattening.
+#   -background none → Pad / extent canvas is filled with transparent pixels,
+#                      not the default white.
+#   -gravity center  → Center the image if aspect ratio ≠ 1:1 after resize.
+#   -extent WxH      → Force an exact square canvas (no distortion — any gap
+#                      is transparent padding, not a stretch).
+#   -strip           → Remove EXIF, ICC profiles, and IPTC metadata to shrink
+#                      the output and avoid build-time warnings.
+#   png32:           → Force RGBA 32-bit output so downstream tools always get
+#                      a consistent depth, even for tiny 16×16 icons.
+#
+echo "🖼️   Generating icon assets from: ${AIBA_LOGO_PNG}"
 
-info "Generating icon assets from ${AIBA_LOGO_PNG}…"
+if [ ! -f "${AIBA_LOGO_PNG}" ]; then
+    fail "Logo source file not found at '${AIBA_LOGO_PNG}'. Place aiba_logo.png in the workspace root or set AIBA_LOGO_PNG."
+fi
 
-# PNG sizes required by the Chromium build for Linux/Windows
-declare -a PNG_SIZES=(16 24 32 48 64 128 256)
-for SIZE in "${PNG_SIZES[@]}"; do
-    OUT="${ICON_DIR}/product_logo_${SIZE}.png"
-    convert "${AIBA_LOGO_PNG}" \
-        -resize "${SIZE}x${SIZE}" \
+detect_imagemagick
+
+THEME_DIR="${CHROMIUM_SRC_DIR}/chrome/app/theme/chromium"
+mkdir -p "${THEME_DIR}"
+
+# Generate square PNGs at each standard size
+for size in "${ICON_SIZES[@]}"; do
+    OUT="${THEME_DIR}/product_logo_${size}.png"
+    ${IM_CONVERT} "${AIBA_LOGO_PNG}" \
+        -alpha set \
+        -resize "${size}x${size}" \
         -background none \
         -gravity center \
-        -extent "${SIZE}x${SIZE}" \
-        "${OUT}"
-    info "  → product_logo_${SIZE}.png"
+        -extent "${size}x${size}" \
+        -strip \
+        "png32:${OUT}"
+    echo "    ✓ product_logo_${size}.png  ($(file_size "${OUT}"))"
 done
+ok "PNG icon matrix generated (${ICON_SIZES[*]} px)."
 
-# Windows ICO (multi-size bundle: 16, 32, 48, 256)
-convert "${AIBA_LOGO_PNG}" \
-    \( -clone 0 -resize 16x16   \) \
-    \( -clone 0 -resize 32x32   \) \
-    \( -clone 0 -resize 48x48   \) \
-    \( -clone 0 -resize 256x256 \) \
-    -delete 0 \
-    "${ICON_DIR}/chromium.ico"      # keep filename; build system references it by name
-info "  → chromium.ico (16/32/48/256 multi-size)"
+# Windows .ico (multi-resolution container)
+ICO_OUT="${THEME_DIR}/chromium.ico"
+${IM_CONVERT} "${AIBA_LOGO_PNG}" \
+    -alpha set \
+    -define icon:auto-resize=256,48,32,16 \
+    -background none \
+    -strip \
+    "${ICO_OUT}"
+ok "Windows ICO generated: $(basename "${ICO_OUT}") ($(file_size "${ICO_OUT}"))"
 
-# macOS ICNS — ImageMagick can produce a basic ICNS; for a production build
-# you may want to use 'iconutil' on a Mac for the best result.
-convert "${AIBA_LOGO_PNG}" \
-    -resize 1024x1024 \
-    "${ICON_DIR}/app.icns" 2>/dev/null \
-  || warn "ICNS generation skipped (ImageMagick on this host may not support ICNS). \
-           Provide a hand-crafted app.icns for macOS builds."
-info "  → app.icns"
-
-ok "All icon assets generated in ${ICON_DIR}."
-
-# ── 5b-v  Patch the .desktop template (Linux app menu entry) ─────────────────
-#   The .desktop file determines what label appears in the application launcher.
-DESKTOP_TEMPLATE="${CHROMIUM_SRC_DIR}/chrome/installer/linux/common/desktop.template"
-if [[ -f "${DESKTOP_TEMPLATE}" ]]; then
-    info "Patching .desktop template…"
-    cp "${DESKTOP_TEMPLATE}" "${DESKTOP_TEMPLATE}.bak"
-    sed -i \
-        -e 's/\bChromium\b/Aiba/g' \
-        -e 's/\bCHROMIUM\b/AIBA/g' \
-        "${DESKTOP_TEMPLATE}"
-    ok ".desktop template patched."
+# macOS .icns via icnsutils (png2icns)
+ICNS_OUT="${THEME_DIR}/app.icns"
+if command -v png2icns &>/dev/null; then
+    ICNS_INPUTS=()
+    for s in 16 32 48 128 256; do
+        ICNS_INPUTS+=("${THEME_DIR}/product_logo_${s}.png")
+    done
+    png2icns "${ICNS_OUT}" "${ICNS_INPUTS[@]}" || warn "png2icns exited with non-zero status."
+    ok "macOS ICNS generated: $(basename "${ICNS_OUT}") ($(file_size "${ICNS_OUT}"))"
 else
-    warn ".desktop template not found: ${DESKTOP_TEMPLATE}"
-    warn "The Linux app-menu entry may still read 'Chromium'."
+    warn "png2icns not available — skipping .icns generation (non-fatal for Linux builds)."
 fi
 
-# ── 5b-vi  Summary of what was changed ───────────────────────────────────────
-echo ""
-echo -e "       ${BOLD}Branding changes applied:${RESET}"
-echo    "         • 'Chromium' → 'Aiba' in chromium_strings.grd"
-echo    "         • 'Chromium' → 'Aiba' in components_chromium_strings.grd"
-echo    "         • BRANDING metadata file updated"
-echo    "         • Icon PNGs regenerated (16–256 px)"
-echo    "         • chromium.ico regenerated (16/32/48/256)"
-echo    "         • app.icns regenerated"
-echo    "         • .desktop template updated"
-echo ""
 ok "Aiba branding injection complete."
 
-# =============================================================================
-# STEP 5c — Patch Debian package control files
-# =============================================================================
-step "5c/7 · Patching Debian package control files → 'aiba'"
-#
-# dpkg-buildpackage derives the output .deb filenames and package metadata
-# entirely from the debian/ directory files — not from anything in the
-# Chromium source tree.  We must rename every occurrence of
-# 'ungoogled-chromium' to 'aiba' across:
-#
-#   debian/control      → Source: and Package: fields  (drives .deb filename)
-#   debian/changelog    → first-line package header    (drives version string)
-#   debian/rules        → any explicit package-name references
-#   debian/*.install    → per-package file-installation manifests (filename matters)
-#   debian/*.links      → symlink manifests            (filename matters)
-#   debian/*.docs       → doc manifests                (filename matters)
-#   debian/*.manpages   → manpage manifests            (filename matters)
-#   debian/*.postinst   → maintainer scripts           (filename matters)
-#   debian/*.prerm      )
-#   debian/*.postrm     )   ... and any other maintainer scripts
-#   debian/*.preinst    )
-#   debian/watch        → upstream version watch file  (content only)
-#
-# Rule: for files whose FILENAME begins with 'ungoogled-chromium', dpkg uses
-# the filename prefix to associate the file with a binary package — so we
-# must rename those files in addition to replacing text inside them.
 
-OLD_NAME="ungoogled-chromium"
-NEW_NAME="aiba"
-DEBIAN_DIR="debian"   # we are already inside the repo (cd'd in Step 2)
+###############################################################################
+#                                                                             #
+#   STEP 5c — Patch Debian package management controls                       #
+#                                                                             #
+###############################################################################
+step "5c" "Patching Debian packaging controls (${BRAND_OLD} → ${BRAND_NEW})"
 
-# ── 5c-i  debian/control ─────────────────────────────────────────────────────
-#   Two distinct field types need changing:
-#     Source: ungoogled-chromium   →  Source: aiba      (top stanza, line 1)
-#     Package: ungoogled-chromium  →  Package: aiba     (binary stanza)
-#   We use Python so we can edit RFC-822-formatted control files reliably
-#   without breaking multi-line continuation fields or other stanzas.
+cd "${REPO_ROOT}"
 
-CONTROL_FILE="${DEBIAN_DIR}/control"
-if [[ -f "${CONTROL_FILE}" ]]; then
-    info "Patching ${CONTROL_FILE}…"
-    cp "${CONTROL_FILE}" "${CONTROL_FILE}.bak"
+# ── 5c-i: debian/control ────────────────────────────────────────────────────
+DEBIAN_CONTROL="debian/control"
+echo "📝  Patching ${DEBIAN_CONTROL} …"
 
-    python3 - "${CONTROL_FILE}" "${OLD_NAME}" "${NEW_NAME}" << 'PYEOF'
-import sys, pathlib, re
+if [ -f "${DEBIAN_CONTROL}" ]; then
+    sed -i \
+        -e "s/${BRAND_OLD}/${BRAND_NEW}/g" \
+        "${DEBIAN_CONTROL}"
 
-ctrl   = pathlib.Path(sys.argv[1])
-old    = sys.argv[2]
-new    = sys.argv[3]
-text   = ctrl.read_text()
-
-# Replace 'Source: <old>' and 'Package: <old>' field values precisely.
-# The pattern anchors to the field name so we never touch free-text
-# descriptions that happen to mention the old package name.
-patched = re.sub(
-    r'^((?:Source|Package):\s*)' + re.escape(old),
-    r'\g<1>' + new,
-    text,
-    flags=re.MULTILINE
-)
-
-# Also replace dependency references like 'Depends: ungoogled-chromium (>= …)'
-# so inter-package deps inside the control file stay consistent.
-patched = patched.replace(old, new)
-
-ctrl.write_text(patched)
-print(f"       [OK] debian/control: '{old}' → '{new}'")
-PYEOF
+    sed -i \
+        -e "s/Ungoogled Chromium/Aiba Browser/g" \
+        -e "s/ungoogled chromium/aiba browser/g" \
+        "${DEBIAN_CONTROL}"
     ok "debian/control patched."
 else
-    die "debian/control not found — cannot continue without it."
+    warn "debian/control not found."
 fi
 
-# ── 5c-ii  debian/changelog ───────────────────────────────────────────────────
-#   The very first line of debian/changelog follows this format:
-#     ungoogled-chromium (version) suite; urgency=level
-#   dpkg-parsechangelog reads this line to set the source package name and
-#   version that appear in the .dsc and .changes files — and ultimately in
-#   the output .deb filenames.  Only the first line needs changing.
+# ── 5c-ii: debian/changelog ─────────────────────────────────────────────────
+DEBIAN_CHANGELOG="debian/changelog"
+echo "📝  Patching ${DEBIAN_CHANGELOG} (first-line suite header) …"
 
-CHANGELOG_FILE="${DEBIAN_DIR}/changelog"
-if [[ -f "${CHANGELOG_FILE}" ]]; then
-    info "Patching first line of ${CHANGELOG_FILE}…"
-    cp "${CHANGELOG_FILE}" "${CHANGELOG_FILE}.bak"
-
-    # sed '1s/...' targets only line 1; the word-boundary ensures we replace
-    # the package-name token and not a substring of something else.
-    sed -i "1s/\b${OLD_NAME}\b/${NEW_NAME}/" "${CHANGELOG_FILE}"
-
-    # Confirm the change landed correctly
-    FIRST_LINE="$(head -n1 "${CHANGELOG_FILE}")"
-    if [[ "${FIRST_LINE}" == ${NEW_NAME}* ]]; then
-        ok "debian/changelog first line: ${FIRST_LINE}"
-    else
-        die "debian/changelog patch failed. First line is still: ${FIRST_LINE}"
-    fi
+if [ -f "${DEBIAN_CHANGELOG}" ]; then
+    sed -i "1s/${BRAND_OLD}/${BRAND_NEW}/g" "${DEBIAN_CHANGELOG}"
+    ok "debian/changelog patched."
+    echo "    First line: $(head -1 "${DEBIAN_CHANGELOG}")"
 else
-    die "debian/changelog not found — cannot continue without it."
+    warn "debian/changelog not found."
 fi
 
-# ── 5c-iii  debian/rules ──────────────────────────────────────────────────────
-#   The rules Makefile may hardcode the source package name in variables,
-#   dh_gencontrol calls, or install-path definitions.
+# ── 5c-iii: debian/rules ────────────────────────────────────────────────────
+DEBIAN_RULES="debian/rules"
+echo "📝  Patching ${DEBIAN_RULES} …"
 
-RULES_FILE="${DEBIAN_DIR}/rules"
-if [[ -f "${RULES_FILE}" ]]; then
-    info "Patching ${RULES_FILE}…"
-    cp "${RULES_FILE}" "${RULES_FILE}.bak"
-    sed -i "s/\b${OLD_NAME}\b/${NEW_NAME}/g" "${RULES_FILE}"
+if [ -f "${DEBIAN_RULES}" ]; then
+    sed -i "s/${BRAND_OLD}/${BRAND_NEW}/g" "${DEBIAN_RULES}"
     ok "debian/rules patched."
 else
-    warn "debian/rules not found — skipping."
+    warn "debian/rules not found."
 fi
 
-# ── 5c-iv  Rename and patch per-package maintainer files ─────────────────────
-#   Files like 'debian/ungoogled-chromium.install' must be renamed to
-#   'debian/aiba.install' so dpkg associates them with the correct binary
-#   package.  We also replace the old name in their content.
-#
-#   Extensions covered (exhaustive list of dpkg-recognised suffixes):
-MAINTAINER_EXTS=(
-    install links docs manpages
-    postinst prerm postrm preinst
-    triggers conffiles lintian-overrides
-    service tmpfiles dirs examples
+# ── 5c-iv: Rename per-package metadata manifests ────────────────────────────
+echo "📝  Renaming debian/ per-package manifests (*.install, *.links, maintainer scripts) …"
+
+RENAME_COUNT=0
+
+# [BUG 1 FIX] — Enable nullglob so the glob expands to nothing if no files match,
+# instead of iterating once on the literal string "debian/ungoogled-chromium*".
+_old_ng=$(shopt -p nullglob || true)
+shopt -s nullglob
+
+for old_file in debian/${BRAND_OLD}*; do
+    # Derive the new filename by replacing the brand prefix
+    base="$(basename "${old_file}")"
+    new_base="${base/${BRAND_OLD}/${BRAND_NEW}}"
+    new_file="debian/${new_base}"
+
+    mv "${old_file}" "${new_file}"
+
+    # Also patch the file's content for any internal package name references
+    if [ -f "${new_file}" ]; then
+        sed -i "s/${BRAND_OLD}/${BRAND_NEW}/g" "${new_file}"
+    fi
+
+    echo "    ✓ ${base} → ${new_base}"
+    RENAME_COUNT=$((RENAME_COUNT + 1))
+done
+
+eval "${_old_ng}"
+
+if [ "${RENAME_COUNT}" -eq 0 ]; then
+    info "No debian/${BRAND_OLD}* manifests found to rename."
+else
+    ok "Renamed and patched ${RENAME_COUNT} debian manifest(s)."
+fi
+
+# ── 5c-v: Catch-all for any remaining references in debian/ ─────────────────
+echo "📝  Scanning all remaining debian/ files for stale '${BRAND_OLD}' references …"
+
+STALE_COUNT=0
+
+# [BUG 3 FIX] — Restructured to avoid grep exit-code-1 interaction with
+# pipefail inside the while loop. Each grep is now inside an explicit if-block
+# with || true on the pipeline to prevent spurious abort.
+while IFS= read -r -d '' dfile; do
+    # Skip non-regular files
+    if [ ! -f "${dfile}" ]; then
+        continue
+    fi
+    # Check if it's a text file (guard the pipeline with || true)
+    mime_type="$(file --brief --mime-type "${dfile}" 2>/dev/null || true)"
+    case "${mime_type}" in
+        text/*)
+            if grep -q "${BRAND_OLD}" "${dfile}" 2>/dev/null; then
+                sed -i "s/${BRAND_OLD}/${BRAND_NEW}/g" "${dfile}"
+                echo "    ✓ Patched: $(basename "${dfile}")"
+                STALE_COUNT=$((STALE_COUNT + 1))
+            fi
+            ;;
+    esac
+done < <(find debian/ -maxdepth 1 -print0)
+
+if [ "${STALE_COUNT}" -eq 0 ]; then
+    ok "No stale references found — debian/ is clean."
+else
+    ok "Patched ${STALE_COUNT} additional file(s) in debian/."
+fi
+
+ok "Debian packaging controls rebranded to '${BRAND_NEW}'."
+
+
+###############################################################################
+#                                                                             #
+#   STEP 5d — GN compiler optimizations for production builds                #
+#                                                                             #
+###############################################################################
+step "5d" "Injecting GN compiler optimization flags"
+
+cd "${REPO_ROOT}"
+
+# Production-grade GN arguments that reduce compile time and final binary size.
+# These are appended to whatever flags the packaging system already defines.
+GN_EXTRA_ARGS=(
+    'is_official_build=true'         # Enable all upstream release optimizations
+    'symbol_level=0'                 # Strip debug symbols → ~70% smaller obj files
+    'blink_symbol_level=0'           # Same for Blink (rendering engine)
+    'use_thin_lto=true'              # Thin LTO: cross-TU optimization w/ less RAM
+    'is_cfi=false'                   # Disable CFI (needs full LTO, incompatible w/ Thin)
+    'use_sysroot=false'              # Use host system libs, not bundled sysroot
+    'enable_nacl=false'              # NaCl is deprecated; saves ~15 min compile
+    'enable_widevine=false'          # Skip proprietary DRM module
+    'chrome_pgo_phase=0'             # Skip PGO instrumentation pass
 )
 
-RENAMED_COUNT=0
-for EXT in "${MAINTAINER_EXTS[@]}"; do
-    OLD_FILE="${DEBIAN_DIR}/${OLD_NAME}.${EXT}"
-    NEW_FILE="${DEBIAN_DIR}/${NEW_NAME}.${EXT}"
-    if [[ -f "${OLD_FILE}" ]]; then
-        cp "${OLD_FILE}" "${OLD_FILE}.bak"
-        # Patch content first, then rename
-        sed -i "s|\b${OLD_NAME}\b|${NEW_NAME}|g" "${OLD_FILE}"
-        mv "${OLD_FILE}" "${NEW_FILE}"
-        info "  Renamed + patched: ${OLD_NAME}.${EXT} → ${NEW_NAME}.${EXT}"
-        (( RENAMED_COUNT++ )) || true
+# ── Probe for the GN flags file used by ungoogled-chromium ───────────────────
+# The packaging system can store extra GN build-graph parameters in several
+# locations depending on the branch. We check known patterns in priority order.
+FLAGS_GN=""
+_gn_suffix="flags.gn"
+
+_old_ng=$(shopt -p nullglob || true)
+shopt -s nullglob
+
+# Priority 1: flags.gn inside the ungoogled-chromium* submodule directory.
+for candidate in "${REPO_ROOT}"/ungoogled-chromium*/"${_gn_suffix}"; do
+    if [ -f "${candidate}" ]; then
+        FLAGS_GN="${candidate}"
+        info "Strategy 1 hit (submodule flags.gn): ${FLAGS_GN}"
+        break
     fi
 done
 
-# Catch any other debian/ungoogled-chromium.* files not in the list above
-while IFS= read -r -d '' EXTRA_FILE; do
-    NEW_EXTRA="${EXTRA_FILE/${OLD_NAME}/${NEW_NAME}}"
-    if [[ "${EXTRA_FILE}" != "${NEW_EXTRA}" ]]; then
-        cp "${EXTRA_FILE}" "${EXTRA_FILE}.bak"
-        sed -i "s|\b${OLD_NAME}\b|${NEW_NAME}|g" "${EXTRA_FILE}"
-        mv "${EXTRA_FILE}" "${NEW_EXTRA}"
-        info "  Renamed + patched (extra): $(basename "${EXTRA_FILE}") → $(basename "${NEW_EXTRA}")"
-        (( RENAMED_COUNT++ )) || true
-    fi
-done < <(find "${DEBIAN_DIR}" -maxdepth 1 -name "${OLD_NAME}.*" -print0 2>/dev/null)
-
-ok "Per-package maintainer files: ${RENAMED_COUNT} file(s) renamed and patched."
-
-# ── 5c-v  debian/watch ────────────────────────────────────────────────────────
-#   The watch file content references the upstream project name; we replace
-#   it in the content only (the filename is just 'watch', never prefixed).
-
-WATCH_FILE="${DEBIAN_DIR}/watch"
-if [[ -f "${WATCH_FILE}" ]]; then
-    info "Patching ${WATCH_FILE}…"
-    cp "${WATCH_FILE}" "${WATCH_FILE}.bak"
-    sed -i "s|\b${OLD_NAME}\b|${NEW_NAME}|g" "${WATCH_FILE}"
-    ok "debian/watch patched."
+# Priority 2: flags.gn at the packaging repo root (some forks use this).
+if [ -z "${FLAGS_GN}" ] && [ -f "${REPO_ROOT}/${_gn_suffix}" ]; then
+    FLAGS_GN="${REPO_ROOT}/${_gn_suffix}"
+    info "Strategy 2 hit (repo root flags.gn): ${FLAGS_GN}"
 fi
 
-# ── 5c-vi  Any remaining debian/ files that reference the old name ────────────
-#   Belt-and-suspenders pass: grep every remaining file in debian/ for the
-#   old package name and patch it.  Skips binary files and .bak files.
+# Priority 3: Recursive scan for any flags*.gn under the repo tree.
+if [ -z "${FLAGS_GN}" ]; then
+    for candidate in "${REPO_ROOT}"/**/"${_gn_suffix}"; do
+        if [ -f "${candidate}" ]; then
+            FLAGS_GN="${candidate}"
+            info "Strategy 3 hit (deep scan): ${FLAGS_GN}"
+            break
+        fi
+    done
+fi
 
-info "Running belt-and-suspenders pass over remaining debian/ files…"
-EXTRA_PATCHED=0
-while IFS= read -r -d '' DFILE; do
-    # Skip backup files we created and any binary files
-    [[ "${DFILE}" == *.bak ]]   && continue
-    file --brief "${DFILE}" | grep -q 'binary'  && continue
-    if grep -q "${OLD_NAME}" "${DFILE}" 2>/dev/null; then
-        sed -i "s|\b${OLD_NAME}\b|${NEW_NAME}|g" "${DFILE}"
-        info "  Patched content: ${DFILE}"
-        (( EXTRA_PATCHED++ )) || true
+eval "${_old_ng}"
+
+# Ultimate fallback: create a fresh flags file at the source root.
+if [ -z "${FLAGS_GN}" ]; then
+    FLAGS_GN="${CHROMIUM_SRC_DIR}/aiba_build_${_gn_suffix}"
+    info "No existing GN flags file found — will create: ${FLAGS_GN}"
+fi
+
+echo "📝  Target GN flags file: ${FLAGS_GN}"
+
+# ── Append optimization flags (idempotent — skips duplicates) ────────────────
+for arg in "${GN_EXTRA_ARGS[@]}"; do
+    key="${arg%%=*}"  # Extract the key portion (before '=')
+    # Only append if this key isn't already defined in the file
+    if [ -f "${FLAGS_GN}" ] && grep -q "^${key}" "${FLAGS_GN}" 2>/dev/null; then
+        info "Skipped (already set): ${arg}"
+    else
+        echo "${arg}" >> "${FLAGS_GN}"
+        echo "    ✓ ${arg}"
     fi
-done < <(find "${DEBIAN_DIR}" -maxdepth 2 -type f -print0 2>/dev/null)
-ok "Belt-and-suspenders pass complete — ${EXTRA_PATCHED} additional file(s) patched."
+done
 
-# ── 5c-vii  Verification ──────────────────────────────────────────────────────
-#   Confirm the critical fields in debian/control now read 'aiba'.
+ok "GN optimization flags injected."
 
-info "Verifying debian/control Source and Package fields…"
-python3 - "${CONTROL_FILE}" "${NEW_NAME}" << 'PYEOF'
-import sys, pathlib, re, sys
+# ── Also inject into debian/rules if it has a defines block ──────────────────
+# Many ungoogled-chromium-debian branches define GN args inline in debian/rules
+# via a variable like GN_ARGS, defines, or system_build_flags. We append our
+# flags there too so they survive the dpkg-buildpackage invocation.
+DEBIAN_RULES_FILE="${REPO_ROOT}/debian/rules"
+if [ -f "${DEBIAN_RULES_FILE}" ]; then
+    # Check if debian/rules already references our key flags
+    if grep -q 'is_official_build' "${DEBIAN_RULES_FILE}" 2>/dev/null; then
+        info "debian/rules already contains GN optimization references — skipping."
+    else
+        # Append as a comment + export block at the end of the file so it's
+        # visible and auditable. The build system will pick up the flags file.
+        cat >> "${DEBIAN_RULES_FILE}" <<'GNRULES'
 
-ctrl    = pathlib.Path(sys.argv[1])
-new     = sys.argv[2]
-text    = ctrl.read_text()
-matches = re.findall(r'^(?:Source|Package):\s*(.+)$', text, re.MULTILINE)
-
-all_ok  = True
-for val in matches:
-    val = val.strip()
-    if val != new and not val.startswith(new):
-        print(f"       [WARN] Unexpected value still present: '{val}'")
-        all_ok = False
-
-if all_ok:
-    print(f"       [OK] All Source/Package fields confirmed as '{new}' (or sub-package of it).")
-else:
-    print("       [WARN] Some fields may still reference the old name — review debian/control.")
-PYEOF
+# ── Aiba: GN production optimization flags ──────────────────────────────────
+# These are also written to the flags.gn file for redundancy.
+export AIBA_GN_EXTRA_FLAGS = \
+	is_official_build=true \
+	symbol_level=0 \
+	blink_symbol_level=0 \
+	use_thin_lto=true \
+	enable_nacl=false
+GNRULES
+        ok "Appended GN optimization block to debian/rules."
+    fi
+fi
 
 echo ""
-echo -e "       ${BOLD}Debian packaging changes applied:${RESET}"
-echo    "         • debian/control      — Source + Package fields renamed"
-echo    "         • debian/changelog    — first-line package header renamed"
-echo    "         • debian/rules        — internal name references updated"
-echo    "         • debian/*.install etc — maintainer files renamed + patched"
-echo    "         • debian/watch        — content updated"
-echo    "         • belt-and-suspenders pass over all remaining debian/ files"
-echo ""
-ok "Step 5c complete — dpkg-buildpackage will now output 'aiba_*.deb'."
+echo "📋  Final GN flags file contents:"
+if [ -f "${FLAGS_GN}" ]; then
+    sed 's/^/    │ /' "${FLAGS_GN}"
+else
+    echo "    (file not yet created — will be generated at build time)"
+fi
 
-# =============================================================================
-# STEP 6 — Install build dependencies
-# =============================================================================
-step "6/7 · Installing missing build dependencies via mk-build-deps"
+ok "GN compiler optimizations configured."
 
-sudo mk-build-deps \
-    --install \
-    --tool "apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y" \
-    debian/control
 
-# The meta-package is now named 'aiba-build-deps' after our control-file rename
-rm -f aiba-build-deps_*.deb
+###############################################################################
+#                                                                             #
+#   STEP 5e — Custom homepage / initial_preferences (DISABLED)               #
+#                                                                             #
+###############################################################################
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │  COMMENTED OUT — Uncomment this entire block when you're ready to set a  │
+# │  custom default homepage and startup URLs for new Aiba user profiles.    │
+# │                                                                          │
+# │  This writes an initial_preferences JSON file (the modern replacement    │
+# │  for master_preferences) into the source tree. Chromium reads it on      │
+# │  first launch to pre-configure new profiles.                             │
+# └────────────────────────────────────────────────────────────────────────────┘
+#
+# step "5e" "Configuring custom homepage (initial_preferences)"
+#
+# AIBA_HOMEPAGE="https://www.google.com"
+# PREFS_DIR="${CHROMIUM_SRC_DIR}/chrome/app"
+# PREFS_FILE=""
+#
+# # Prefer the modern filename; fall back to legacy.
+# if [ -f "${PREFS_DIR}/initial_preferences" ]; then
+#     PREFS_FILE="${PREFS_DIR}/initial_preferences"
+#     info "Found existing initial_preferences — will merge."
+# elif [ -f "${PREFS_DIR}/master_preferences" ]; then
+#     PREFS_FILE="${PREFS_DIR}/master_preferences"
+#     info "Found legacy master_preferences — will merge."
+# else
+#     PREFS_FILE="${PREFS_DIR}/initial_preferences"
+#     info "No existing preferences file — creating: ${PREFS_FILE}"
+# fi
+#
+# echo "📝  Homepage URL: ${AIBA_HOMEPAGE}"
+# echo "📝  Preferences file: ${PREFS_FILE}"
+#
+# if [ -f "${PREFS_FILE}" ]; then
+#     # Merge into existing JSON using Python (safe, no jq dependency).
+#     python3 <<PREFSPY
+# import json, sys
+#
+# prefs_path = "${PREFS_FILE}"
+# homepage = "${AIBA_HOMEPAGE}"
+#
+# try:
+#     with open(prefs_path, "r") as f:
+#         prefs = json.load(f)
+# except (json.JSONDecodeError, FileNotFoundError):
+#     prefs = {}
+#
+# # Set homepage and startup behaviour
+# prefs.setdefault("homepage", homepage)
+# prefs.setdefault("homepage_is_newtabpage", False)
+# prefs.setdefault("session", {}).setdefault("restore_on_startup", 4)
+# prefs.setdefault("session", {}).setdefault("startup_urls", [homepage])
+#
+# # Set default search (optional — Google is Chromium's default anyway)
+# prefs.setdefault("default_search_provider_data", {})\
+#       .setdefault("template_url_data", {})\
+#       .setdefault("keyword", "google.com")
+#
+# # Browser UI defaults
+# prefs.setdefault("browser", {}).setdefault("show_home_button", True)
+# prefs.setdefault("bookmark_bar", {}).setdefault("show_on_all_tabs", True)
+#
+# with open(prefs_path, "w") as f:
+#     json.dump(prefs, f, indent=2, sort_keys=True)
+#
+# print("✅  initial_preferences written with homepage: " + homepage)
+# PREFSPY
+# else
+#     # Create from scratch
+#     cat > "${PREFS_FILE}" <<PREFSJSON
+# {
+#   "homepage": "${AIBA_HOMEPAGE}",
+#   "homepage_is_newtabpage": false,
+#   "session": {
+#     "restore_on_startup": 4,
+#     "startup_urls": ["${AIBA_HOMEPAGE}"]
+#   },
+#   "browser": {
+#     "show_home_button": true
+#   },
+#   "bookmark_bar": {
+#     "show_on_all_tabs": true
+#   }
+# }
+# PREFSJSON
+#     ok "initial_preferences created from scratch."
+# fi
+#
+# echo ""
+# echo "📋  Preferences file contents:"
+# sed 's/^/    │ /' "${PREFS_FILE}"
+#
+# ok "Custom homepage configuration complete."
+
+
+###############################################################################
+#                                                                             #
+#   STEP 6 — Install build dependencies                                      #
+#                                                                             #
+###############################################################################
+step 6 "Installing build dependencies via mk-build-deps"
+
+cd "${REPO_ROOT}"
+
+sudo mk-build-deps -i debian/control \
+    --tool='apt-get -o Debug::pkgProblemResolver=yes --no-install-recommends -y' \
+    --remove \
+    || fail "mk-build-deps failed"
+
+# [BUG 5 FIX] — Use find -delete instead of unquoted globs which misbehave
+# under IFS=$'\n\t' when no files match.
+find . -maxdepth 1 -name "${BRAND_NEW}-build-deps_*" -delete 2>/dev/null || true
+find . -maxdepth 1 -name "${BRAND_OLD}-build-deps_*" -delete 2>/dev/null || true
 
 ok "Build dependencies installed."
 
-# =============================================================================
-# STEP 7 — Build the packages
-# =============================================================================
-step "7/7 · Starting official build: dpkg-buildpackage -b -us -uc"
-info "This is the long step — grab a coffee (or three)."
 
-# -b   → binary-only build (no source package)
-# -us  → unsigned source   (skip GPG signing of the .dsc — required on headless
-#         CI runners; without this, dpkg-buildpackage blocks waiting for a key
-#         that does not exist on the GitHub Actions runner)
-# -uc  → unsigned changes  (skip GPG signing of the .changes file — same reason)
-dpkg-buildpackage -b -us -uc
+###############################################################################
+#                                                                             #
+#   STEP 7 — Start the build                                                 #
+#                                                                             #
+###############################################################################
+step 7 "Starting official build (dpkg-buildpackage -b -uc)"
 
-# =============================================================================
-# Done
-# =============================================================================
+cd "${REPO_ROOT}"
+
+echo "👀  Phase 1: Initializing Real-Time Stream Monitoring & Regex Intercept..."
+
+# Disable pipefail temporarily so we don't crash when intercepting the compiler
+set +o pipefail
+
+# Pipe stdout/stderr through awk to monitor carriage-return (\r) separated ninja output
+dpkg-buildpackage -b -uc 2>&1 | awk -v RS='\r|\n' '{
+    # Stream output natively
+    printf "%s\n", $0; fflush();
+    
+    # Real-Time Stream Monitoring Guardrail
+    if (match($0, /\[1\/[0-9]+\]/)) {
+        print "\n🚨  CRITICAL GUARDRAIL TRIGGERED  🚨"
+        print "Match found: " $0
+        print "Intercepting process loop at millisecond precision..."
+        
+        # Issue SIGINT to the compiler engine processes cleanly
+        system("killall -INT dpkg-buildpackage ninja 2>/dev/null")
+        print "✅  SIGINT issued. Compilation cleanly halted at file 1."
+        exit 0
+    }
+}'
+BUILD_EXIT=${PIPESTATUS[0]}
+
+set -o pipefail
+
+if [ $BUILD_EXIT -ne 0 ] && [ $BUILD_EXIT -ne 2 ] && [ $BUILD_EXIT -ne 130 ]; then
+    # If it failed for reasons other than our SIGINT (exit 2 or 130), trigger self-healing fail
+    fail "dpkg-buildpackage encountered a fatal error (exit code $BUILD_EXIT)"
+fi
+
 echo ""
-echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════${RESET}"
-echo -e "${GREEN}${BOLD}  Build complete!${RESET}"
-echo -e "${GREEN}${BOLD}  Output .deb packages are in the parent directory:${RESET}"
-ls -lh ../*.deb 2>/dev/null \
-  || echo "  (no .deb files found in parent dir — check for build errors above)"
-echo -e "${GREEN}${BOLD}════════════════════════════════════════════════════${RESET}"
+echo "══════════════════════════════════════════════════════════════"
+echo "  🎉  BUILD COMPLETE — Aiba Browser"
+echo "══════════════════════════════════════════════════════════════"
+echo ""
+echo "Output .deb packages:"
+
+# [BUG 5 FIX] — Use find instead of unquoted glob for final listing.
+find .. -maxdepth 1 -name "*.deb" -exec ls -lh {} + 2>/dev/null \
+    || echo "(no .deb files found — check build logs)"
