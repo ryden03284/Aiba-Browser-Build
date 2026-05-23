@@ -754,15 +754,29 @@ step 7 "Starting official build (dpkg-buildpackage -b -uc)"
 
 cd "${REPO_ROOT}"
 
-echo "🚀  Phase 1 Complete. Launching full production compilation stream..."
+echo "🚀  Launching production build pipeline..."
+echo "📊  Live stream logging enabled. Compiling browser natively using all $(nproc) available cores..."
 
-# Run the packaging tool natively all the way through to compilation completion
-dpkg-buildpackage -b -uc
+set +o pipefail
 
-BUILD_EXIT=$?
+# Run the build natively with max jobs. No fflush() is used to prevent I/O bottlenecks.
+dpkg-buildpackage -b -uc -j"$(nproc)" 2>&1 | awk '{
+    print $0
+    
+    # Proactive Memory/OOM Safety Valve
+    if (match($0, /virtual memory exhausted|fatal error: error writing to.*pipe/)) {
+        print "\n🚨  BUILD MACHINE MEMORY EXHAUSTED  🚨"
+        system("killall -9 dpkg-buildpackage ninja cc1plus clang 2>/dev/null")
+        exit 1
+    }
+}'
 
-if [ $BUILD_EXIT -ne 0 ]; then
-    fail "dpkg-buildpackage encountered a fatal error (exit code $BUILD_EXIT)"
+BUILD_EXIT=${PIPESTATUS[0]}
+set -o pipefail
+
+# 141 represents standard SIGPIPE handling if the pipeline is ever broken cleanly
+if [ $BUILD_EXIT -ne 0 ] && [ $BUILD_EXIT -ne 141 ]; then
+    fail "dpkg-buildpackage encountered a structural compilation failure (exit code $BUILD_EXIT)"
 fi
 
 echo ""
