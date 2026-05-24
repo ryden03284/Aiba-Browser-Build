@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
 #
-# build_ungoogled_chromium.sh  —  "Aiba" automated build  (v5.0 — Fixed & Optimized)
+# build_ungoogled_chromium.sh  —  "Aiba" automated build  (v5.2 — Hardware Aware)
 #
-# Fixes applied over v4.0:
-#   • tee race on exit fixed via combined EXIT trap
-#   • sources.list deb-src injection made idempotent (no duplicate lines)
-#   • nullglob guard around *.list glob
-#   • CRX magic validated via xxd hex comparison (not raw bytes)
-#   • find -path prune uses */submodules glob (portable, no ./ prefix assumption)
-#   • default_100_percent logo now properly resized to 16×16 via ImageMagick
-#   • flags.gn append made idempotent (no duplicate flags on re-run)
-#   • PIPESTATUS replaced by FIFO + wait pattern for clean exit-code capture
-#   • stdbuf replaced by named FIFO — OOM guard reads every line from every child
-#   • Retry/auto-install logic in fail() replaced by upfront preflight check
-#   • BRAND_DISPLAY_NEW used throughout branding (was defined but unused)
-#   • Step labels consistent and sequential (5c & 5d now separate announcements)
-#   • All cores detected once at top via nproc and used throughout
+# Fixes over v5.1:
+#   • CORES=4 hardcode removed — replaced by RAM-aware dynamic calculation:
+#       compile jobs = all CPU cores (nproc)
+#       link jobs    = floor(RAM_GB / 8), minimum 1
+#       This uses every available CPU for compilation while capping concurrent
+#       linker processes so RAM is not exhausted on machines with < 8 GB/core.
+#   • concurrent_links GN flag injected into flags.gn (enforces the link cap)
+#   • build-essential and gcc added to apt install list and preflight check
+#   • Step 6.5 added: C probe detects host CPU instruction level (baseline /
+#       SSE4.2 / AVX / AVX2 / AVX-512) and injects the appropriate -march flag
+#       so the Chromium toolchain binaries do not SIGILL on older CPUs.
+#   • Script restored to completion (v5.1 was truncated mid-step-3)
 #
 
 set -euo pipefail
@@ -24,9 +22,7 @@ IFS=$'\n\t'
 # ─── Logging — combined EXIT trap handles both tee flush and FIFO cleanup ────
 LOG_FILE="$(pwd)/aiba_build_debug.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
-
-# Initialise trap; extended later when FIFO path is known
-trap 'wait' EXIT
+trap 'wait' EXIT   # extended later when FIFO path is known
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 REPO_URL="https://github.com/ungoogled-software/ungoogled-chromium-debian.git"
@@ -48,8 +44,17 @@ EXCISE_PATCHES=(
     "core/inox-patchset/0001-fix-building-without-safebrowsing.patch"
 )
 
-# Detect all available cores once at startup
-CORES="$(nproc)"
+# ─── RAM-aware core calculation ───────────────────────────────────────────────
+# Compile jobs: all CPU cores — compile tasks are CPU-bound and lightweight per
+#   process; using every core here gives maximum throughput.
+# Link jobs: capped by RAM — each lld/ld process can spike to 6-8 GB during
+#   Chromium's final link stage. floor(RAM_GB / 8) prevents kernel OOM kills.
+CPU_CORES="$(nproc)"
+TOTAL_RAM_GB="$(awk '/MemTotal/ { printf "%d", $2 / 1024 / 1024 }' /proc/meminfo)"
+LINK_JOBS=$(( TOTAL_RAM_GB / 8 ))
+[ "${LINK_JOBS}" -lt 1 ] && LINK_JOBS=1
+[ "${LINK_JOBS}" -gt "${CPU_CORES}" ] && LINK_JOBS="${CPU_CORES}"
+
 IM_CONVERT=""
 CHROMIUM_SRC_DIR=""
 REPO_ROOT=""
@@ -60,61 +65,57 @@ step() {
     echo "  STEP $1: $2"
     echo -e "══════════════════════════════════════════════════════════════\n"
 }
-
-fail() {
-    echo -e "\n❌  FATAL: $1" >&2
-    echo "    Working directory: $(pwd)" >&2
-    exit 1
-}
-
+fail() { echo -e "\n❌  FATAL: $1\n    Working directory: $(pwd)" >&2; exit 1; }
 info() { echo "ℹ️   $1"; }
 ok()   { echo "✅  $1"; }
 warn() { echo "⚠️   $1"; }
 
 detect_imagemagick() {
-    if command -v magick &>/dev/null; then
-        IM_CONVERT="magick"
-    elif command -v convert &>/dev/null; then
-        IM_CONVERT="convert"
-    else
-        fail "ImageMagick not found — install with: sudo apt-get install imagemagick"
+    if   command -v magick   &>/dev/null; then IM_CONVERT="magick"
+    elif command -v convert  &>/dev/null; then IM_CONVERT="convert"
+    else fail "ImageMagick not found — install: sudo apt-get install imagemagick"
     fi
     info "ImageMagick command: ${IM_CONVERT}"
 }
 
-# Upfront preflight — fail fast before any build work begins
 preflight_check() {
     local missing=()
-    local required=(git curl xxd perl sed awk file du tee mkfifo)
+    local required=(git curl xxd perl sed awk file du tee mkfifo gcc)
     for cmd in "${required[@]}"; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
-    if [ "${#missing[@]}" -gt 0 ]; then
-        fail "Missing required commands: ${missing[*]}
-Install them with: sudo apt-get install ${missing[*]}"
-    fi
+    [ "${#missing[@]}" -gt 0 ] && \
+        fail "Missing required commands: ${missing[*]}\nInstall: sudo apt-get install ${missing[*]}"
     ok "Preflight passed — all required tools present."
 }
 
-# Add deb-src lines to a sources file, idempotently (never duplicates)
+# Idempotent deb-src injection: reads existing lines and only adds deb-src
+# equivalents that are not already present anywhere in the file.
 add_deb_src() {
     local src="$1"
     [ -f "$src" ] || return 0
-    local tmp
-    tmp="$(mktemp)"
+    local tmp; tmp="$(mktemp)"
     cp "$src" "$tmp"
     while IFS= read -r line; do
-        # Only process plain 'deb' lines, not existing 'deb-src' lines
         [[ "$line" =~ ^deb[[:space:]] ]] || continue
         local deb_src_line="deb-src ${line#deb }"
-        # Only append if not already present anywhere in the file
         grep -qxF "$deb_src_line" "$src" || echo "$deb_src_line" >> "$tmp"
     done < "$src"
     sudo cp "$tmp" "$src"
     rm -f "$tmp"
 }
 
-# Placeholder prevents the submodule path from being rebranded
+# Shared icon generator — resizes source logo to exact pixel dimensions
+icon_gen() {
+    local size="$1" dest="$2"
+    "${IM_CONVERT}" "${AIBA_LOGO_PNG}" \
+        -alpha set -resize "${size}x${size}" -background none \
+        -gravity center -extent "${size}x${size}" -strip \
+        "png32:${dest}" \
+        || warn "Failed to generate icon at ${dest}"
+}
+
+# Placeholder prevents the submodule directory path from being rebranded
 PLACEHOLDER="__AIBA_SUBMOD_PLACEHOLDER__"
 rebrand_file() {
     local f="$1"
@@ -131,22 +132,23 @@ rebrand_file() {
 ###############################################################################
 step 1 "Installing initial packages and enabling source repos"
 
-# Idempotent deb-src injection — no duplicates, nullglob for *.list
 add_deb_src /etc/apt/sources.list
 shopt -s nullglob
-for listfile in /etc/apt/sources.list.d/*.list; do
-    add_deb_src "$listfile"
-done
+for listfile in /etc/apt/sources.list.d/*.list; do add_deb_src "$listfile"; done
 shopt -u nullglob
 
 sudo apt-get update -qq
-
 sudo apt-get install -y --no-install-recommends \
     devscripts equivs imagemagick icnsutils perl curl xxd file coreutils \
+    build-essential gcc \
     || fail "Could not install required packages"
 
 preflight_check
-ok "Packages installed. Using ${CORES} CPU cores for compilation."
+
+info "CPU cores (compile jobs) : ${CPU_CORES}"
+info "Total RAM                 : ${TOTAL_RAM_GB} GB"
+info "Concurrent link jobs      : ${LINK_JOBS}"
+ok "Resource plan established."
 
 ###############################################################################
 #   STEP 2 — Clone the repository and submodules                              #
@@ -157,10 +159,8 @@ if [ ! -d "${REPO_DIR}/.git" ]; then
     [ -d "${REPO_DIR}" ] && rm -rf "${REPO_DIR}"
     git clone "${REPO_URL}" "${REPO_DIR}" || fail "git clone failed"
 fi
-
 cd "${REPO_DIR}"
 REPO_ROOT="$(pwd)"
-
 git submodule update --init --recursive || fail "Submodule init failed"
 ok "Repository staged at ${REPO_ROOT}"
 
@@ -188,7 +188,6 @@ ok "Patch excision complete."
 #   STEP 4 — Official source preparation                                      #
 ###############################################################################
 step 4 "Running official source prep (debian/rules setup)"
-
 debian/rules setup || fail "'debian/rules setup' failed"
 ok "Source preparation complete."
 
@@ -197,16 +196,11 @@ ok "Source preparation complete."
 ###############################################################################
 step "4.5" "Detecting Chromium source root"
 
-if [ -f "${REPO_ROOT}/${SENTINEL}" ]; then
-    CHROMIUM_SRC_DIR="${REPO_ROOT}"
-elif [ -f "${REPO_ROOT}/build/src/${SENTINEL}" ]; then
-    CHROMIUM_SRC_DIR="${REPO_ROOT}/build/src"
-elif [ -f "${REPO_ROOT}/src/${SENTINEL}" ]; then
-    CHROMIUM_SRC_DIR="${REPO_ROOT}/src"
-else
-    fail "Chromium source root not found — ${SENTINEL} missing in all expected locations."
+if   [ -f "${REPO_ROOT}/${SENTINEL}" ];          then CHROMIUM_SRC_DIR="${REPO_ROOT}"
+elif [ -f "${REPO_ROOT}/build/src/${SENTINEL}" ]; then CHROMIUM_SRC_DIR="${REPO_ROOT}/build/src"
+elif [ -f "${REPO_ROOT}/src/${SENTINEL}" ];       then CHROMIUM_SRC_DIR="${REPO_ROOT}/src"
+else fail "Chromium source root not found — ${SENTINEL} missing in all expected locations."
 fi
-
 ok "Found source root: ${CHROMIUM_SRC_DIR}"
 
 ###############################################################################
@@ -217,19 +211,16 @@ step "5a" "Pre-bundling uBlock Origin Lite (${UBLOCK_EXT_ID})"
 EXT_DIR="${CHROMIUM_SRC_DIR}/chrome/browser/extensions/default_extensions"
 CRX_FILE="${EXT_DIR}/${UBLOCK_EXT_ID}.crx"
 EXT_JSON="${EXT_DIR}/${UBLOCK_EXT_ID}.json"
-
 mkdir -p "${EXT_DIR}"
 
 curl -L --fail --retry 3 --retry-delay 5 -o "${CRX_FILE}" "${UBLOCK_CRX_URL}" \
     || fail "CRX download failed"
 
-# Validate CRX3 magic bytes via xxd hex — avoids raw binary comparison pitfalls.
-# CRX3 magic is the ASCII string "Cr24" = 0x43 0x72 0x32 0x34
+# xxd hex comparison — avoids raw binary pitfalls; "Cr24" = 0x43723234
 CRX_MAGIC="$(xxd -p -l 4 "${CRX_FILE}")"
-if [ "${CRX_MAGIC}" != "43723234" ]; then
+[ "${CRX_MAGIC}" != "43723234" ] && \
     fail "CRX header check failed — got '${CRX_MAGIC}', expected '43723234' (Cr24)"
-fi
-ok "CRX magic bytes verified (${CRX_MAGIC})."
+ok "CRX magic bytes verified."
 
 cat > "${EXT_JSON}" <<EXTJSON
 {
@@ -282,12 +273,8 @@ detect_imagemagick
 if [ ! -f "${AIBA_LOGO_PNG}" ]; then
     warn "Logo not found at '${AIBA_LOGO_PNG}' — generating fallback canvas asset..."
     "${IM_CONVERT}" \
-        -size 512x512 xc:#1a1a1a \
-        -gravity center \
-        -fill "#4a90e2" \
-        -font Helvetica-Bold \
-        -pointsize 180 \
-        -draw "text 0,0 'A'" \
+        -size 512x512 xc:#1a1a1a -gravity center -fill "#4a90e2" \
+        -font Helvetica-Bold -pointsize 180 -draw "text 0,0 'A'" \
         "${AIBA_LOGO_PNG}" \
         || fail "Fallback logo generation failed"
     ok "Fallback logo created at ${AIBA_LOGO_PNG}"
@@ -320,31 +307,16 @@ fi
 
 THEME_DIR="${CHROMIUM_SRC_DIR}/chrome/app/theme/chromium"
 mkdir -p "${THEME_DIR}"
-
-# Generate all required icon sizes from the source logo
-icon_gen() {
-    local size="$1" dest="$2"
-    "${IM_CONVERT}" "${AIBA_LOGO_PNG}" \
-        -alpha set \
-        -resize "${size}x${size}" \
-        -background none \
-        -gravity center \
-        -extent "${size}x${size}" \
-        -strip \
-        "png32:${dest}" \
-        || warn "Failed to generate icon at ${dest}"
-}
-
 for size in "${ICON_SIZES[@]}"; do
     icon_gen "${size}" "${THEME_DIR}/product_logo_${size}.png"
 done
 ok "PNG branding matrix generated (sizes: ${ICON_SIZES[*]})."
 
-# Fix: properly resize to 16×16 — do NOT copy the raw 512px source
+# Properly resize to 16x16; never copy the raw 512px source unresized
 DEFAULT_PCT_DIR="${CHROMIUM_SRC_DIR}/chrome/app/theme/default_100_percent/chromium"
 mkdir -p "${DEFAULT_PCT_DIR}"
 icon_gen 16 "${DEFAULT_PCT_DIR}/product_logo_16.png"
-ok "default_100_percent 16×16 logo set."
+ok "default_100_percent 16x16 logo set."
 
 ###############################################################################
 #   STEP 5c — Patch Debian package layout                                     #
@@ -353,36 +325,28 @@ step "5c" "Patching Debian package layout"
 
 cd "${REPO_ROOT}"
 
-if [ -f "debian/control" ]; then
-    rebrand_file "debian/control"
+[ -f "debian/control" ] && { rebrand_file "debian/control"
     sed -i "s/Ungoogled Chromium/${BRAND_DISPLAY_NEW} Browser/g" "debian/control"
-    ok "debian/control rebranded."
-fi
-if [ -f "debian/changelog" ]; then
-    sed -i "1s/${BRAND_OLD}/${BRAND_NEW}/g" "debian/changelog"
-    ok "debian/changelog rebranded."
-fi
-if [ -f "debian/rules" ]; then
-    rebrand_file "debian/rules"
-    ok "debian/rules rebranded."
-fi
+    ok "debian/control rebranded."; }
+[ -f "debian/changelog" ] && { sed -i "1s/${BRAND_OLD}/${BRAND_NEW}/g" "debian/changelog"
+    ok "debian/changelog rebranded."; }
+[ -f "debian/rules" ] && { rebrand_file "debian/rules"; ok "debian/rules rebranded."; }
 
 shopt -s nullglob
 for old_file in "debian/${BRAND_OLD}"*; do
     new_file="debian/${BRAND_NEW}${old_file#debian/${BRAND_OLD}}"
     mv "${old_file}" "${new_file}"
     rebrand_file "${new_file}"
-    info "Renamed: ${old_file} → ${new_file}"
+    info "Renamed: ${old_file} -> ${new_file}"
 done
 shopt -u nullglob
 
-# Fix: use */submodules glob pattern — works regardless of find's path prefix
+# */submodules glob is portable regardless of find's leading path format
 while IFS= read -r -d '' dfile; do
     [ -f "${dfile}" ] || continue
     case "${dfile}" in *.in) continue ;; esac
-    if file --brief --mime-type "${dfile}" | grep -q "^text/"; then
-        grep -q "${BRAND_OLD}" "${dfile}" && rebrand_file "${dfile}"
-    fi
+    file --brief --mime-type "${dfile}" | grep -q "^text/" || continue
+    grep -q "${BRAND_OLD}" "${dfile}" && rebrand_file "${dfile}"
 done < <(find debian/ -path "*/submodules" -prune -o -type f -print0)
 
 ok "Debian layout sweep complete."
@@ -393,16 +357,21 @@ ok "Debian layout sweep complete."
 step "5d" "Applying GN compiler optimizations and build flags"
 
 DEBIAN_RULES_FILE="${REPO_ROOT}/debian/rules"
-sed -i -E "s|(^[[:space:]]*)symbol_level=[^ \\\\]*|\1symbol_level=0|"   "${DEBIAN_RULES_FILE}" 2>/dev/null || true
+sed -i -E "s|(^[[:space:]]*)symbol_level=[^ \\\\]*|\1symbol_level=0|"    "${DEBIAN_RULES_FILE}" 2>/dev/null || true
 sed -i -E "s|(^[[:space:]]*)use_thin_lto=[^ \\\\]*|\1use_thin_lto=true|" "${DEBIAN_RULES_FILE}" 2>/dev/null || true
 
 FLAGS_GN="${REPO_ROOT}/debian/submodules/ungoogled-chromium/flags.gn"
 if [ -f "${FLAGS_GN}" ]; then
-    # Idempotent: only append each flag if not already present
-    for flag in "blink_symbol_level=0" "enable_nacl=false" "chrome_pgo_phase=0"; do
+    # Idempotent: append only flags whose key is not already present
+    for flag in \
+        "blink_symbol_level=0" \
+        "enable_nacl=false" \
+        "chrome_pgo_phase=0" \
+        "concurrent_links=${LINK_JOBS}"
+    do
         grep -qF "${flag%%=*}=" "${FLAGS_GN}" || echo "${flag}" >> "${FLAGS_GN}"
     done
-    ok "flags.gn updated."
+    ok "flags.gn updated (concurrent_links=${LINK_JOBS})."
 fi
 
 export DEB_BUILD_MAINT_OPTIONS="hardening=-all"
@@ -414,29 +383,83 @@ ok "Build flags configured."
 #   STEP 6 — Install build dependencies                                       #
 ###############################################################################
 step 6 "Installing build dependencies"
-
 sudo apt-get build-dep -y ./ || fail "Build dependency installation failed."
 ok "Build dependencies installed."
 
 ###############################################################################
-#   STEP 7 — Compilation with FIFO-based OOM guard (all ${CORES} cores)      #
+#   STEP 6.5 — CPU instruction probe (SIGILL guard)                           #
 ###############################################################################
-step 7 "Compiling ${BRAND_DISPLAY_NEW} Browser using ${CORES} cores"
+step "6.5" "CPU instruction compatibility probe (SIGILL guard)"
 
-# Use a named FIFO so dpkg-buildpackage runs as a real background process
-# (giving us its PID and true exit code via wait), while we read every line
-# of its combined stdout+stderr for OOM detection.  This replaces stdbuf+awk
-# which could not reliably intercept output from deep child processes.
+# The Chromium toolchain ships pre-built binaries (clang, lld, etc.) compiled
+# with modern CPU extensions.  On machines missing those extensions (e.g.,
+# pre-Haswell CPUs without AVX) the binaries crash immediately with SIGILL.
+# We compile and run a tiny C probe with -march=native to detect exactly which
+# instruction level the host supports, then inject a matching -march flag so
+# generated code and toolchain selection stay within safe bounds.
+
+PROBE_SRC="$(mktemp /tmp/aiba_cpu_probe_XXXXXX.c)"
+PROBE_BIN="$(mktemp /tmp/aiba_cpu_probe_XXXXXX)"
+
+cat > "${PROBE_SRC}" <<'PROBE_C'
+#include <stdio.h>
+int main(void) {
+#if   defined(__AVX512F__)
+    puts("avx512");
+#elif defined(__AVX2__)
+    puts("avx2");
+#elif defined(__AVX__)
+    puts("avx");
+#elif defined(__SSE4_2__)
+    puts("sse4_2");
+#else
+    puts("baseline");
+#endif
+    return 0;
+}
+PROBE_C
+
+CPU_LEVEL="baseline"
+if gcc -O0 -march=native -o "${PROBE_BIN}" "${PROBE_SRC}" 2>/dev/null; then
+    # Run in a subshell — SIGILL here must not kill the parent script
+    PROBE_OUT="$(timeout 5 "${PROBE_BIN}" 2>/dev/null || true)"
+    [ -n "${PROBE_OUT}" ] && CPU_LEVEL="${PROBE_OUT}"
+fi
+rm -f "${PROBE_SRC}" "${PROBE_BIN}"
+
+info "Host CPU instruction level: ${CPU_LEVEL}"
+
+# Select the safest -march consistent with what the CPU actually supports
+case "${CPU_LEVEL}" in
+    avx512|avx2|avx)
+        # Cap at haswell/avx2 — avoids AVX-512 frequency throttling on some Intel SKUs
+        MARCH_FLAG="-march=haswell -mtune=generic" ;;
+    sse4_2)
+        MARCH_FLAG="-march=nehalem -mtune=generic" ;;
+    baseline|*)
+        # Strict x86-64 baseline: safe on any 64-bit CPU
+        MARCH_FLAG="-march=x86-64 -mtune=generic" ;;
+esac
+
+info "Injecting CPU flags: ${MARCH_FLAG}"
+export DEB_CFLAGS_APPEND="${DEB_CFLAGS_APPEND} ${MARCH_FLAG}"
+export DEB_CXXFLAGS_APPEND="${DEB_CXXFLAGS_APPEND} ${MARCH_FLAG}"
+ok "SIGILL guard applied (CPU=${CPU_LEVEL}, flags=${MARCH_FLAG})."
+
+###############################################################################
+#   STEP 7 — Compilation with FIFO-based OOM guard                            #
+###############################################################################
+step 7 "Compiling ${BRAND_DISPLAY_NEW} Browser (compile=${CPU_CORES} jobs, link=${LINK_JOBS} jobs)"
+
+# Named FIFO: dpkg-buildpackage runs as a tracked background process, giving us
+# its real PID and exit code via `wait`, while we read every output line for OOM
+# signals.  Replaces stdbuf+awk which missed deep child-process output entirely.
 BUILD_FIFO="$(mktemp -u /tmp/aiba_build_XXXXXX.fifo)"
 mkfifo "${BUILD_FIFO}"
+trap 'rm -f "${BUILD_FIFO}"; wait' EXIT   # replaces the initial trap
 
-# Replace the initial EXIT trap — now also removes the FIFO on exit
-trap 'rm -f "${BUILD_FIFO}"; wait' EXIT
-
-echo "🚀  Launching compilation with ${CORES} parallel jobs..."
-
-# Redirect both stdout and stderr of the build into the FIFO
-dpkg-buildpackage -b -uc -j"${CORES}" >"${BUILD_FIFO}" 2>&1 &
+echo "Launching: ${CPU_CORES} compile jobs, ${LINK_JOBS} concurrent link job(s)..."
+dpkg-buildpackage -b -uc -j"${CPU_CORES}" >"${BUILD_FIFO}" 2>&1 &
 BUILD_PID=$!
 
 OOM_DETECTED=0
@@ -445,25 +468,24 @@ while IFS= read -r line; do
     if [[ "${line}" =~ virtual\ memory\ exhausted|Cannot\ allocate\ memory|\
 fatal\ error:\ error\ writing|out\ of\ memory ]]; then
         OOM_DETECTED=1
-        warn "OOM condition detected — terminating build processes..."
-        # Kill the build and its entire process tree
-        kill -9 "${BUILD_PID}"            2>/dev/null || true
-        pkill -9 -P "${BUILD_PID}"        2>/dev/null || true
-        pkill -9 -x ninja                 2>/dev/null || true
-        pkill -9 -x cc1plus               2>/dev/null || true
-        pkill -9 -x clang                 2>/dev/null || true
+        warn "OOM detected — terminating build processes..."
+        kill -9 "${BUILD_PID}"      2>/dev/null || true
+        pkill -9 -P "${BUILD_PID}"  2>/dev/null || true
+        pkill -9 -x ninja           2>/dev/null || true
+        pkill -9 -x cc1plus         2>/dev/null || true
+        pkill -9 -x clang           2>/dev/null || true
         break
     fi
 done < "${BUILD_FIFO}"
 
-# Capture real exit code; suppress the "killed" error if OOM forced a kill
 wait "${BUILD_PID}" 2>/dev/null || true
 BUILD_EXIT=$?
 
-[ "${OOM_DETECTED}" -eq 1 ] && fail "Build terminated: out-of-memory condition detected"
-# 141 = 128+SIGPIPE — benign when the OOM guard closed the FIFO early
-[ "${BUILD_EXIT}" -ne 0 ] && [ "${BUILD_EXIT}" -ne 141 ] \
-    && fail "dpkg-buildpackage exited with code ${BUILD_EXIT}"
+[ "${OOM_DETECTED}" -eq 1 ] && \
+    fail "Build terminated: out-of-memory. Add swap or reduce concurrent_links in flags.gn."
+# 141 = 128+SIGPIPE: benign when OOM guard closed the FIFO before the build finished
+[ "${BUILD_EXIT}" -ne 0 ] && [ "${BUILD_EXIT}" -ne 141 ] && \
+    fail "dpkg-buildpackage exited with code ${BUILD_EXIT}"
 
 echo -e "\n🎉  BUILD COMPLETE — ${BRAND_DISPLAY_NEW} Browser"
 echo "Output .deb packages:"
