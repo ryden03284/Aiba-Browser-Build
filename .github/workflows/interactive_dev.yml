@@ -80,7 +80,7 @@ jobs:
           detached: true
           limit-access-to-actor: true
 
-      - name: Keep workflow alive and show build heartbeat
+      - name: Keep workflow alive and auto-upload build
         run: |
           echo "===================================================="
           echo "SSH session is live. Connect via the tmate link above."
@@ -89,20 +89,34 @@ jobs:
           echo "===================================================="
 
           while true; do
-            echo "[$(date '+%H:%M:%S')] Runner alive — uptime: $(uptime -p)"
+            echo "[$(date '+%H:%M:%S')] Runner alive — uptime: $(uptime -p) — checking for .deb file..."
 
             ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
 
+            # Look for the finished .deb file
             DEB=$(find "$GITHUB_WORKSPACE" -maxdepth 2 \
                     -name 'ungoogled-chromium_*.deb' \
                     ! -name '*build-deps*' \
                     | head -n 1 || true)
+
             if [[ -n "$DEB" ]]; then
               echo "===================================================="
               echo "BUILD COMPLETE: $(basename "$DEB")"
+              echo "Starting automatic upload to file.kiwi..."
               echo "===================================================="
+              
+              # Automatically accept the npm install prompt and upload the file
+              npx -y @file-kiwi/node "$DEB"
+              
+              echo "===================================================="
+              echo "Upload finished! Terminating VM safely."
+              echo "===================================================="
+              
+              # Force the runner to shut down successfully
               exit 0
             fi
 
+            # If not finished, wait exactly 1 minute (60 seconds) before checking again
+            echo "Build still running. Waiting 1 minute..."
             sleep 60
           done
